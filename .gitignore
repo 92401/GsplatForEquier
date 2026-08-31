@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+
+# IDE
+.idea/
+.vscode/
+
+# 训练产物与缓存（体积大，不入库）
+outputs/
+logs/
+face_cache/
+face_cache_stale_v1/

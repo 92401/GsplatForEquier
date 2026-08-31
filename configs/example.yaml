@@ -1,0 +1,42 @@
+# pano_gsplat 训练配置示例（JSON 或 YAML 均可）
+# 键 = 命令行参数名（连字符键也会被兼容，如 data-dir 等价 data_dir）
+# 命令行显式参数优先于配置文件。
+#
+# 用法:
+#   python train.py --config configs/example.yaml
+#   python train.py --config configs/example.yaml --steps 1000   # 覆盖步数
+#   python train.py --config ... --dump-config out.json         # 导出生效配置
+
+data_dir: 'D:\gaussian_splatting\spirula'
+out_dir: 'D:\gaussian_splatting\pano_gsplat\outputs\full_cfg'
+
+# ---- 数据 ----
+face_size: 1024            # 每面边长；354 张 3840x1920 全景建议 1024
+face_cache: 'D:\gaussian_splatting\pano_gsplat\face_cache'
+
+# ---- 训练 ----
+steps: 8000
+batch_size: 1
+strategy: mcmc             # default | mcmc
+sh_degree: 3
+ssim_lambda: 0.2
+
+# ---- 评测 ----
+test_every: 8              # 每 8 张留 1 张做验证
+eval_every: 2000           # 每 1000 步评测一次
+eval_max_images: 20
+save_eval_images: true
+
+# ---- 可选增强（按需开启）----
+absgrad: false            # AbsGS 增密（仅配 default 策略，mcmc 下无效）
+packed: false
+sparse_grad: false
+bilagrid: false            # 曝光/白平衡校正
+ppisp: false               # PPISP 光度校正（曝光/晕影/颜色/CRF，逐视角 slot）
+# ppisp_mode: hybrid       # per_view（Spirula）| hybrid（曝光/颜色按全景共享）
+# ppisp_lr: 0.002          # PPISP 主参数学习率
+# ppisp_reg_scale: 1.0     # PPISP 正则损失权重
+random_bkgd: false         # 随机背景
+pose_opt: false            # 位姿优化（rig 感知）
+depth_supervision_weight: 0.0   # >0 启用深度监督
+# depth_dir: 'D:\gaussian_splatting\spirula\depths'   # MoGe 稠密深度目录

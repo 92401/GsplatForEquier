@@ -1,0 +1,54 @@
+COLMAP sparse
+     │
+     ▼
+load_sparse ──> cameras, images, points_xyz(P,3), points_rgb(P,3)
+     │
+     ▼
+build_camtoworlds ──> c2w (N,4,4)
+     │
+     ▼
+normalize_world ──> c2w (N,4,4), points_xyz (P,3), scene_scale
+     │
+     ├──> pinhole_intrinsics(S) ──> K (3,3) ──> Ks (6,3,3)
+     │
+     └──> for each pano:
+              face_rotation(d) x6 ──> R_face (3,3)
+              build_face_c2w ──────> face_c2w (N,6,4,4)
+     │
+     ▼
+make_splats(points, cfg, device) ──> splats (P,*)
+     │
+     ▼
+make_optimizers(splats, cfg, scene_scale) ──> optimizers (dict)
+make_strategy(cfg, splats, optimizers, scene_scale) ──> strategy, state
+     │
+     ▼
+for step in range(steps):
+     idxs ← random B 全景
+     for idx: get_faces ──> (6,S,S,3); face_c2w[idx] ──> (6,4,4)
+     cat ──> gt (B*6,S,S,3), camtoworlds (B*6,4,4), Ks_b (B*6,3,3)
+     │
+     ▼
+     rasterization ──> renders (B*6,S,S,3), alphas, info
+     │
+     ▼
+     strategy.step_pre_backward(...)
+     │
+     ▼
+     l1 = F.l1_loss(renders, gt)           # scalar
+     ssim = fused_ssim(...)                # scalar
+     loss = (1-λ)·l1 + λ·(1-ssim)         # scalar
+     loss.backward()                      # splats[*].grad 填充
+     │
+     ▼
+     strategy.step_post_backward(...)      # clone/split/prune
+     │
+     ▼
+     opt.step() + zero_grad()
+     means_scheduler.step()
+     │
+     ▼
+     周期性 save_preview / save_ply / torch.save
+     │
+     ▼
+final: save_ply + torch.save

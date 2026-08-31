@@ -1,0 +1,8 @@
+# pano_gsplat 运行依赖（建议直接使用已有的 gsplat conda 环境）
+gsplat>=1.5
+torch
+numpy
+scikit-learn
+imageio
+fused-ssim
+torchmetrics
