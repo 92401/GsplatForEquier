@@ -122,6 +122,12 @@ def parse_args():
                    help="packed rasterization (less memory, slightly slower)")
     p.add_argument("--sparse-grad", action="store_true",
                    help="sparse gradients (requires --packed)")
+    # --- 主机卸载（naive：参数+优化器常驻内存，每步整批搬运）---
+    p.add_argument("--offload", choices=["none", "naive", "clm"], default="none",
+                   help="none=全 GPU；naive=参数/Adam 在 CPU，每步整批传 GPU 并搬回梯度；"
+                        "clm=保留关键属性在 GPU、SH 分页（未实现）")
+    p.add_argument("--bench-gaussians", type=int, default=0,
+                   help="把点云平铺膨胀到指定高斯数，用于显存/内存压力测试")
     # --- 评测---
     p.add_argument("--test-every", type=int, default=0,
                    help="hold out every Nth image for validation (0 = none)")
@@ -216,12 +222,16 @@ def rgb_to_sh(rgb: torch.Tensor) -> torch.Tensor:
     return (rgb - 0.5) / C0
 
 #点云初始化为高斯
-def make_splats(points_xyz, points_rgb, cfg, device):
+def make_splats(points_xyz, points_rgb, cfg, device, init_scales=None):
     """Seed Gaussians from the sparse point cloud (gsplat-style init)."""
     means = torch.from_numpy(points_xyz).float().to(device)
     rgbs = torch.from_numpy(points_rgb / 255.0).float().to(device)
 
-    dist_avg = torch.from_numpy(knn_scale(points_xyz)).float().to(device)
+    if init_scales is None:
+        dist_avg = torch.from_numpy(knn_scale(points_xyz)).float().to(device)
+    else:
+        # 压力测试：直接用平铺的 KNN 尺度，避免在千万级点云上跑 KNN
+        dist_avg = torch.from_numpy(init_scales).float().to(device)
     scales = torch.log(dist_avg * cfg.init_scale).unsqueeze(-1).repeat(1, 3)
     quats = torch.rand((len(means), 4), device=device)
     opacities = torch.logit(
@@ -243,7 +253,7 @@ def make_splats(points_xyz, points_rgb, cfg, device):
     return splats
 
 
-def make_optimizers(splats, cfg, scene_scale: float):
+def make_optimizers(splats, cfg, scene_scale: float, fused: bool = True):
     """One Adam per parameter group; LR scaled like gsplat's simple_trainer."""
     BS = cfg.batch_size * len(FACE_DIRS)  # 每次训练光栅化针孔相机数量
     lrs = {
@@ -263,7 +273,7 @@ def make_optimizers(splats, cfg, scene_scale: float):
             eps=1e-15 / math.sqrt(BS),
             betas=(1 - BS * (1 - 0.9), 1 - BS * (1 - 0.999)),   #调整学习率倍数，因为6张要放大
         )
-        if not cfg.sparse_grad:
+        if fused and not cfg.sparse_grad:
             opts["fused"] = True  # SparseAdam 不支持 fused
         optimizers[name] = optimizer_cls(**opts)
         #batch_size=6(或更大)这一事实反映到 Adam 的所有自适应超参上,放大学习率,使训练更稳定
@@ -332,6 +342,8 @@ def evaluate(cfg, splats, device, val_idx, images, pano_paths, is_pano,
 
     psnrs, ssims, lpipss = [], [], []
     with torch.no_grad():
+        # 主机卸载模式下参数在 CPU，评测时统一拷贝一份到 GPU
+        sp = {k: v.detach().to(device) for k, v in splats.items()}
         for vi in val_idx[: cfg.eval_max_images]:
             if is_pano:
                 gt = get_faces(pano_paths[vi], equirect, S, cfg.face_cache, device)
@@ -352,12 +364,12 @@ def evaluate(cfg, splats, device, val_idx, images, pano_paths, is_pano,
                 ks_t = K0.unsqueeze(0)
                 H, W = img.shape[0], img.shape[1]
 
-            colors = torch.cat([splats["sh0"], splats["shN"]], dim=1)
+            colors = torch.cat([sp["sh0"], sp["shN"]], dim=1)
             renders, _, _ = rasterization(
-                means=splats["means"],
-                quats=splats["quats"],
-                scales=torch.exp(splats["scales"]),
-                opacities=torch.sigmoid(splats["opacities"]),
+                means=sp["means"],
+                quats=sp["quats"],
+                scales=torch.exp(sp["scales"]),
+                opacities=torch.sigmoid(sp["opacities"]),
                 colors=colors,
                 viewmats=torch.linalg.inv(c2w_t),
                 Ks=ks_t,
@@ -436,6 +448,21 @@ def main():
     if cfg.depth_dir and cfg.depth_supervision_weight <= 0.0:
         print("[cfg] --depth-dir given without weight; using 0.1")
         cfg.depth_supervision_weight = 0.1
+    # 主机卸载（naive）约束：v1 只支持 default 策略，暂不支持 packed/sparse_grad/absgrad
+    if cfg.offload == "clm":
+        raise SystemExit("[offload] clm 模式尚未实现，请先使用 --offload naive")
+    if cfg.offload == "naive":
+        if cfg.strategy != "default":
+            raise SystemExit(
+                "[offload] naive 模式 v1 只支持 --strategy default"
+                "（MCMC 的全局采样需在 CPU 端重写，暂未实现）")
+        if cfg.packed:
+            raise SystemExit("[offload] naive 模式 v1 暂不支持 --packed")
+        if cfg.sparse_grad:
+            print("[cfg] --offload naive 自动关闭 --sparse-grad")
+            cfg.sparse_grad = False
+        if cfg.absgrad:
+            raise SystemExit("[offload] naive 模式 v1 暂不支持 --absgrad")
     set_seed(cfg.seed)
     device = cfg.device
     os.makedirs(cfg.out_dir, exist_ok=True)
@@ -490,6 +517,23 @@ def main():
     c2w, points_xyz = normalize_world(c2w, points_xyz)  #归一化坐标
     scene_scale = np.linalg.norm(c2w[:, :3, 3], axis=1).max() * 1.1  #创建整个场景的尺度，尺度为归一化后的相机到原点的距离的最大值的1.1倍，确保所有相机都在场景内
     print(f"[data] normalized scene scale = {scene_scale:.4f}")
+
+    # 压力测试：把点云平铺膨胀到目标高斯数
+    # （尺度用原始点的 KNN 结果预计算再平铺，避免在千万级点云上跑 KNN）
+    bench_scales = None
+    if cfg.bench_gaussians > 0:
+        n_src = len(points_xyz)
+        rep = int(math.ceil(cfg.bench_gaussians / n_src))
+        idx = np.tile(np.arange(n_src), rep)[: cfg.bench_gaussians]
+        bench_scales = knn_scale(points_xyz)[idx]
+        # 平铺后的重复点加微小扰动：完全重叠的高斯会把 isect/tile 缓冲撑到
+        # 失真（最坏情况），轻微散开后更接近真实场景的内存占用
+        jitter = np.random.default_rng(0).normal(
+            0.0, 1e-3, points_xyz[idx].shape
+        ).astype(np.float32)
+        points_xyz = points_xyz[idx] + jitter
+        points_rgb = points_rgb[idx]
+        print(f"[bench] inflated {n_src} -> {len(points_xyz)} Gaussians")
 
     S = cfg.face_size  #设置分幅照片的尺寸
     cam_by_id = {c["id"]: c for c in cameras}
@@ -625,9 +669,13 @@ def main():
               f"at step {cfg.coarse_steps}")
 
     # ---- 3. splats + optimizer + strategy --------------------------------
-    splats = make_splats(points_xyz, points_rgb, cfg, device)  # 点云注册为高斯椭球存到gpu
-    optimizers = make_optimizers(splats, cfg, scene_scale)
-    print(f"[model] initialized {len(splats['means'])} Gaussians")
+    splat_device = torch.device("cpu") if cfg.offload == "naive" else device
+    splats = make_splats(points_xyz, points_rgb, cfg, splat_device,
+                         init_scales=bench_scales)  # 点云注册为高斯椭球
+    optimizers = make_optimizers(splats, cfg, scene_scale,
+                                 fused=(cfg.offload != "naive"))
+    print(f"[model] initialized {len(splats['means'])} Gaussians "
+          f"on {splat_device}")
     strategy, strategy_state = make_strategy(cfg, splats, optimizers, scene_scale)
 
     means_scheduler = torch.optim.lr_scheduler.ExponentialLR(
@@ -704,13 +752,23 @@ def main():
             grid_ids = torch.tensor(grid_ids, device=device)
 
         sh_degree = min(step // 1000, cfg.sh_degree)   #3000步以下用低阶分量
-        colors = torch.cat([splats["sh0"], splats["shN"]], dim=1)
+        if cfg.offload == "naive":
+            # 主机卸载：每步从 CPU 主参数派生 GPU 临时参数（不参与 CPU 端 autograd）
+            gpu_params = {
+                k: splats[k].detach().to(device).requires_grad_()
+                for k in splats.keys()
+            }
+            P = gpu_params
+        else:
+            gpu_params = None
+            P = splats
+        colors = torch.cat([P["sh0"], P["shN"]], dim=1)
         render_mode = "RGB+ED" if cfg.depth_supervision_weight > 0.0 else "RGB"
         renders, alphas, info = rasterization(
-            means=splats["means"],
-            quats=splats["quats"],
-            scales=torch.exp(splats["scales"]),
-            opacities=torch.sigmoid(splats["opacities"]),
+            means=P["means"],
+            quats=P["quats"],
+            scales=torch.exp(P["scales"]),
+            opacities=torch.sigmoid(P["opacities"]),
             colors=colors,
             viewmats=torch.linalg.inv(camtoworlds),
             Ks=Ks_b,
@@ -829,9 +887,9 @@ def main():
             if n_used > 0:
                 loss = loss + (depthloss / n_used) * cfg.depth_supervision_weight
         if cfg.scale_reg > 0.0:
-            loss = loss + cfg.scale_reg * torch.exp(splats["scales"]).mean()
+            loss = loss + cfg.scale_reg * torch.exp(P["scales"]).mean()
         if cfg.opacity_reg > 0.0:
-            loss = loss + cfg.opacity_reg * torch.sigmoid(splats["opacities"]).mean()
+            loss = loss + cfg.opacity_reg * torch.sigmoid(P["opacities"]).mean()
         if ppisp is not None:
             loss = loss + cfg.ppisp_reg_scale * ppisp.get_regularization_loss()
         loss.backward()
@@ -849,7 +907,28 @@ def main():
                     is_coalesced=len(Ks_b) == 1,
                 )
         #现在出现梯度，判断是否需要增值，同时更新优化器状态
-        if isinstance(strategy, DefaultStrategy):
+        if cfg.offload == "naive":
+            # 主机卸载：把 GPU 梯度搬回 CPU 主参数，策略整体在 CPU 上运行
+            for k in splats.keys():
+                g = gpu_params[k].grad
+                splats[k].grad = g.detach().to("cpu") if g is not None else None
+            info_cpu = {}
+            for key in ("width", "height", "n_cameras", "radii", "gaussian_ids"):
+                v = info[key]
+                info_cpu[key] = (
+                    v.detach().to("cpu") if isinstance(v, torch.Tensor) else v
+                )
+            m2 = info["means2d"]
+            m2_cpu = m2.detach().to("cpu")
+            if m2.grad is not None:
+                m2_cpu.grad = m2.grad.detach().to("cpu")
+            info_cpu["means2d"] = m2_cpu
+            del gpu_params  # 释放 GPU 临时参数（渲染缓冲由缓存分配器复用）
+            strategy.step_post_backward(
+                params=splats, optimizers=optimizers,
+                state=strategy_state, step=step, info=info_cpu, packed=False,
+            )
+        elif isinstance(strategy, DefaultStrategy):
             strategy.step_post_backward(
                 params=splats, optimizers=optimizers,
                 state=strategy_state, step=step, info=info, packed=cfg.packed,
@@ -880,9 +959,17 @@ def main():
 
         if step % 50 == 0 or step == pbar_steps - 1:  #每五十次播报一次
             mem = torch.cuda.max_memory_allocated() / 1024**3
+            extra = ""
+            if cfg.bench_gaussians > 0:
+                try:
+                    import psutil
+                    extra = (" cpu_peak "
+                             f"{psutil.Process().memory_info().peak_wset / 1e9:.2f} GB")
+                except Exception:
+                    pass
             print(f"[train] step {step:6d} loss {loss.item():.4f} "
                   f"l1 {l1.item():.4f} ssim {ssim.item():.4f} "
-                  f"GS {len(splats['means'])} mem {mem:.2f} GiB "
+                  f"GS {len(splats['means'])} mem {mem:.2f} GiB{extra} "
                   f"time {time.time()-tic:.0f}s")
 
         if cfg.preview_every and (step % cfg.preview_every == 0

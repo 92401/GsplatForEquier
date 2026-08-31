@@ -31,6 +31,7 @@ save_eval_images: true
 absgrad: false            # AbsGS 增密（仅配 default 策略，mcmc 下无效）
 packed: false
 sparse_grad: false
+offload: none             # 主机卸载：none | naive（参数/Adam 在 CPU，仅 default 策略）
 bilagrid: false            # 曝光/白平衡校正
 ppisp: false               # PPISP 光度校正（曝光/晕影/颜色/CRF，逐视角 slot）
 # ppisp_mode: hybrid       # per_view（Spirula）| hybrid（曝光/颜色按全景共享）
