@@ -314,7 +314,7 @@ def evaluate(cfg, splats, device, val_idx, images, pano_paths, is_pano,
              equirect, cam_by_id, face_c2w, Ks, S, step, out_dir):
     """Render held-out views and report PSNR/SSIM (+LPIPS if available)."""
     import json
-
+    #加入ppisp和双边网格之类的评价函数不需要改吗
     if not val_idx:
         return
     if not HAVE_TORCHMETRICS:
@@ -339,7 +339,7 @@ def evaluate(cfg, splats, device, val_idx, images, pano_paths, is_pano,
                 ks_t = Ks.to(device)
                 H, W = S, S
             else:
-                img = load_pano(pano_paths[vi]).to(device)
+                img = load_pano(pano_paths[vi]).to(device)  #读取单张图像的函数
                 cam_cur = cam_by_id[images[vi]["camera_id"]]
                 K0 = torch.from_numpy(camera_K(cam_cur)).float().to(device)
                 sx = img.shape[1] / cam_cur["width"]
@@ -449,17 +449,19 @@ def main():
 
     cam = cameras[0] #查看相机的id
     # 数据模式：全等距柱状 = 全景（每张切成 6 面）；全针孔族 = 透视（每张直接用）
-    is_pano = all(camera_is_equirect(c) for c in cameras)
+    is_pano = all(camera_is_equirect(c) for c in cameras)     #bool判断是否所有相机都是全景相机
     if not is_pano:
         for c in cameras:
-            if camera_is_equirect(c) or c["model"] == 5:
+            if camera_is_equirect(c) or c["model"] == 5:  #不支持混合相机类型
                 raise ValueError("mixed equirect/fisheye cameras not supported")
-    equirect = EquirectCamera(cam["width"], cam["height"]) if is_pano else None
+    #读取全景的参数焦距和图像宽高参数
+    equirect = EquirectCamera(cam["width"], cam["height"]) if is_pano else None  #创建全景相机对象
+    #设置全景相机一张分6张面，透视就是一张
     faces_per_image = 6 if is_pano else 1
     print(f"[data] {len(images)} images, camera model {cam['model']} "
           f"{cam['width']}x{cam['height']}, {len(points_xyz)} sparse points, "
           f"mode={'pano' if is_pano else 'perspective'}")  #打印稀疏数据的读取结果
-
+    #这个基本用不上
     if cfg.max_images > 0:
         images = images[: cfg.max_images]  #限制读取相机数量是为了测试数据时更快，测试时降低训练轮数和分幅出图像的大小可以减少内存占用
     print(f"[data] using {len(images)} panoramas")
@@ -470,19 +472,20 @@ def main():
         path = os.path.join(image_dir, im["name"])
         if not os.path.exists(path):
             raise FileNotFoundError(path)
-        pano_paths.append(path) #存储每个照片的路径
+        pano_paths.append(path) #存储每个全景照片的路径
 
-    # 训练/验证拆分（--test-every 每 N 张留 1 张做验证）
+    # 训练/验证拆分（--test-every 每 N 张留 1 张做验证）  用全幅做验证还是用分出来的单张做验证更合理？
     if cfg.test_every > 0:
-        val_idx = list(range(cfg.test_every - 1, len(images), cfg.test_every))
+        val_idx = list(range(cfg.test_every - 1, len(images), cfg.test_every))  #按照全景图像做验证
         train_idx = [i for i in range(len(images)) if i not in set(val_idx)]
     else:
-        train_idx = list(range(len(images)))
-        val_idx = []
+        train_idx = list(range(len(images)))  #训练集的原始图像编号
+        val_idx = []  #验证集的原始图像编号
     if not train_idx:
         raise ValueError("empty training set; adjust --test-every / --max-images")
-    grid_pos = {orig: pos for pos, orig in enumerate(train_idx)}
-    images_train = [images[i] for i in train_idx]
+    #原始编号到训练数据的映射   
+    grid_pos = {orig: pos for pos, orig in enumerate(train_idx)}  #调试看一下什么数据
+    images_train = [images[i] for i in train_idx]   #只包含训练集的图像字典
     print(f"[data] train {len(train_idx)} / val {len(val_idx)}")
 
     # ---- 2. world normalization + face camera table ----------------------
@@ -492,17 +495,17 @@ def main():
     print(f"[data] normalized scene scale = {scene_scale:.4f}")
 
     S = cfg.face_size  #设置分幅照片的尺寸
-    cam_by_id = {c["id"]: c for c in cameras}
+    cam_by_id = {c["id"]: c for c in cameras}   #根据相机id查找相机参数
     if is_pano:
         K = pinhole_intrinsics(S)  #设置虚拟针孔相机的内参
-        # 6 个面共享同一套内参，复制 6 份
+        # 6 个面共享同一套内参，复制 6 份，复制6份所以命名为Ks
         Ks = torch.from_numpy(np.repeat(K[None], len(FACE_DIRS), axis=0)).float()
         # [n_pano, 6, 4, 4]：为每一张全幅的相机构建 6 个面的相机转世界矩阵
         face_c2w = np.stack([
             np.stack([build_face_c2w(c2w[i], face_rotation(d))
                       for d in FACE_DIRS.values()])
             for i in range(len(c2w))
-        ])
+        ]) 
         print(f"[data] 6 faces per pano, face size {S}x{S}")
     else:
         # 透视相机：K=1，直接用相机自身内参（无切面）
@@ -511,64 +514,69 @@ def main():
         print("[data] perspective: 1 image per camera, native resolution")
 
     # 稀疏深度监督（COLMAP 观测点；MoGe 稠密深度后续可复用同一接口）
-    depth_train = None
+    depth_train = None   #稀疏深度监督，不知道shape
+    #将稀疏点云投影回照片，计算图像的深度
     if cfg.depth_supervision_weight > 0.0:
         face_rots = [face_rotation(d) for d in FACE_DIRS.values()] if is_pano else None
+        #取出面的朝向矩阵
         depth_train = build_sparse_depths(
             sparse, images_train, face_rots, S, is_pano,
             c2w=c2w[train_idx], pts=points_xyz,
-        )
+        )  
 
     # MoGe 稠密深度：加载并按面与稀疏深度做中位比例对齐（归一化场景尺度）
-    dense_aligned = None
+    dense_aligned = None  #对齐后的稠密深度图
+    #MoGe（单目深度估计网络）输出的稠密深度图是无尺度的相对深度——需要归一化场景尺度，
+    # 用colmap的系数点当作锚点，给稠密深度乘比例系数让两者在重合像素上对齐
     if cfg.depth_dir and is_pano:
-        dense_raw = []
+        dense_raw = []    #原始稠密深度图
         for im in images_train:
             dp = os.path.join(cfg.depth_dir,
-                              os.path.splitext(im["name"])[0] + ".pt")
+                              os.path.splitext(im["name"])[0] + ".pt")  #每张全景一个pt文件
+                                #里面是wrap的6个面的稠密深度图
             if not os.path.exists(dp):
                 raise FileNotFoundError(dp)
             dense_raw.append(torch.load(dp, map_location="cpu").float())  # [6,S,S]
-        dense_aligned = []
+        dense_aligned = []  #对齐后的稠密深度图
         all_ratios = []
         for pos in range(len(images_train)):
-            aligned = dense_raw[pos].clone()
+            aligned = dense_raw[pos].clone()  #克隆一份深度图，为什么评价不加深度图?
             ratios = []
             for f in range(6):
-                px_f, d_f = depth_train[pos][f]
+                px_f, d_f = depth_train[pos][f]  ## 该面的稀疏监督深度图 (px[M,2], d[M])
                 if len(px_f) < 5:
                     continue
                 grid = torch.from_numpy(np.stack(
                     [px_f[:, 0] / (S - 1) * 2 - 1,
                      px_f[:, 1] / (S - 1) * 2 - 1], -1)
-                ).float().unsqueeze(0).unsqueeze(0)
+                ).float().unsqueeze(0).unsqueeze(0)  #稀疏点像素坐标归一化到[-1,1]
                 samp = F.grid_sample(
                     aligned[f][None, None], grid, align_corners=True
-                )[0, 0, 0, :]  # [M]
+                )[0, 0, 0, :]  # 用稀疏点像素位置去稠密深度图上采样
                 d_gt_t = torch.from_numpy(d_f).float()
-                m = (samp > 0) & (d_gt_t > 0)
-                if m.sum() >= 5:
+                m = (samp > 0) & (d_gt_t > 0)  #统计有效样本数量
+                if m.sum() >= 5:  #有效样本大于5才使用中位数计算
                     r = d_gt_t[m].median() / samp[m].median()
                     ratios.append(float(r))
                     aligned[f] = aligned[f] * r
             for f in range(6):
                 if len(depth_train[pos][f][0]) < 5:
-                    ratios.append(float("nan"))
+                    ratios.append(float("nan"))   #小于5的先设置为nan
             all_ratios.extend(ratios)
             dense_aligned.append(aligned)
         ratios = torch.tensor([r for r in all_ratios if np.isfinite(r)])
         if len(ratios) == 0:
             raise RuntimeError("no sparse depth overlap for dense alignment")
-        global_r = float(ratios.median())
-        for pos in range(len(dense_aligned)):
+        global_r = float(ratios.median())  #都做完之后统计全局比例，为之前nan的设置全局比例
+        for pos in range(len(dense_aligned)):  #对于那些没有有效样本的面，用全局比例对齐
             for f in range(6):
                 if len(depth_train[pos][f][0]) < 5:
                     dense_aligned[pos][f] = dense_aligned[pos][f] * global_r
         print(f"[data] dense depth aligned (global scale {global_r:.4f})")
 
     # 位姿优化：全景按张（6 面共享）、透视按图；默认零初始化，靠训练学小修正
-    pose_adjust = None
-    pose_optimizer = None
+    pose_adjust = None  #位姿修正，每张全景9个参数6个旋转3个平移
+    pose_optimizer = None  #位姿优化器，用于训练时更新相机位姿
     if cfg.pose_opt:
         from pose import CameraOptModule
         pose_adjust = CameraOptModule(len(train_idx)).to(device)
@@ -576,51 +584,56 @@ def main():
         pose_optimizer = torch.optim.Adam(
             pose_adjust.parameters(),
             lr=cfg.pose_opt_lr * math.sqrt(cfg.batch_size * faces_per_image),
+            #这里区分了全景和透视相机的优化率
             weight_decay=1e-6,
         )
+    
 
-    # bilagrid 曝光/白平衡校正（全景按面、透视按图，每个训练视角一个网格）
-    bil_grids = None
-    bil_optimizer = None
+    # bilagrid 曝光/白平衡校正（全景按面、透视按图，每个训练视角一个网格）  全幅用得上这个吗？
+    bil_grids = None  #每个全幅影像的双边网格，用于曝光/白平衡校正
+    bil_optimizer = None  #曝光/白平衡校正优化器，用于训练时更新曝光/白平衡参数
     if cfg.bilagrid:
         from lib_bilagrid import BilateralGrid
         gx, gy, gw = (int(v) for v in cfg.bilagrid_shape.split(","))
-        n_grids = len(train_idx) * faces_per_image
+        #解析预设的网格形状 gx,gy,gw
+        # gx: 网格宽度，gy: 网格高度，gw: 颜色引导分辨率 每一小格12个参数9个颜色变化系数3个偏执量
+        n_grids = len(train_idx) * faces_per_image #每张分幅图像一个双边网格
         bil_grids = BilateralGrid(n_grids, grid_X=gx, grid_Y=gy, grid_W=gw).to(device)
         BS_grid = cfg.batch_size * faces_per_image
         bil_optimizer = torch.optim.Adam(
             bil_grids.parameters(), lr=2e-3 * math.sqrt(BS_grid), eps=1e-15
-        )
+        )  #学习率随batch_size变化
 
     # PPISP 光度校正（无控制器，避免每视角一个 CNN 造成显存爆炸；
     # per_view=Spirula 语义，hybrid=物理优先绑定）
-    ppisp = None
-    ppisp_optimizers = []
+    ppisp = None   #光度校正模型，用于光度矫正正
+    ppisp_optimizers = []  #多个校正优化器，因为不同的参数需要不同的优化率
     ppisp_schedulers = []
     if cfg.ppisp:
         from ppisp import PPISP, PPISPConfig
         if cfg.ppisp_mode == "hybrid":
-            n_frames = len(train_idx)
-            n_cameras = faces_per_image if is_pano else 1
+            n_frames = len(train_idx)   #帧数
+            n_cameras = faces_per_image if is_pano else 1  #相机数，全景按面、透视按图
             print(f"[ppisp] hybrid binding: num_frames={n_frames} "
                   f"num_cameras={n_cameras}")
+            #让每一帧的曝光和白平衡一致，6个面的渐晕和CRF按照方向独立学习
         else:
-            n_frames = n_cameras = len(train_idx) * faces_per_image
+            n_frames = n_cameras = len(train_idx) * faces_per_image  #另一种模式每个训练视角一个网格
             print(f"[ppisp] {n_frames} per-view slots "
                   f"(Spirula style, controller disabled)")
-        ppisp_cfg = PPISPConfig(use_controller=False)
+        ppisp_cfg = PPISPConfig(use_controller=False)  #不使用控制器，也就是在训练器光度矫正，并未使用新视角自动曝光能力，这样对吗？
         ppisp = PPISP(num_cameras=n_cameras, num_frames=n_frames,
                       config=ppisp_cfg).to(device)
         ppisp_optimizers = ppisp.create_optimizers()
         ppisp_schedulers = ppisp.create_schedulers(ppisp_optimizers, cfg.steps)
 
     # 粗到细：先用低分辨率面热身，再切到完整分辨率
-    Ks_coarse = None
-    if is_pano and cfg.coarse_face_size > 0:
+    Ks_coarse = None   #计算粗阶段相机内参
+    if is_pano and cfg.coarse_face_size > 0:   #只对全景生效
         Kc = pinhole_intrinsics(cfg.coarse_face_size)
         Ks_coarse = torch.from_numpy(
             np.repeat(Kc[None], len(FACE_DIRS), axis=0)
-        ).float()
+        ).float()   #粗分辨率内参
         print(f"[data] coarse-to-fine: {cfg.coarse_face_size} -> {S} "
               f"at step {cfg.coarse_steps}")
 
@@ -639,29 +652,29 @@ def main():
     pbar_steps = cfg.steps
     tic = time.time()
     for step in range(pbar_steps):
-        idxs = [random.choice(train_idx) for _ in range(B)]  #抽取B张训练影像
+        idxs = [random.choice(train_idx) for _ in range(B)]  #抽取B张训练影像 idx抽中的原始图像编号
         # 粗到细：切换当前面的尺寸与内参
-        if is_pano and Ks_coarse is not None and step < cfg.coarse_steps:
+        if is_pano and Ks_coarse is not None and step < cfg.coarse_steps:  #粗阶段
             S_cur, Ks_cur = cfg.coarse_face_size, Ks_coarse
         else:
             S_cur, Ks_cur = S, Ks
         if step == cfg.coarse_steps and is_pano and Ks_coarse is not None:
             print(f"[train] coarse-to-fine: switched to face size {S}")
-        gts = []
-        c2ws = []
-        Ks_list = []
-        for idx in idxs:  #为每一张全幅影像分幅出6个面（或透视图直接用）
+        gts = []  #[B·6, S_cur, S_cur, 3]
+        c2ws = [] #[B·6, 4, 4]
+        Ks_list = []   #每个面的内参列表
+        for idx in idxs:  #为每一张全幅影像分幅出6个面（或透视图直接用），一般idx==1，除非电脑性能较高
             if is_pano:
                 gts.append(get_faces(pano_paths[idx], equirect, S_cur,
                                      cfg.face_cache, device))   #分幅出6个面的图像并存到gpu
                 if pose_adjust is not None:
                     # rig 感知位姿优化：先修正全景位姿，再派生 6 个面
                     from pose import adjust_pano_pose
-                    pano_c2w_t = torch.from_numpy(c2w[idx]).float().to(device)
+                    pano_c2w_t = torch.from_numpy(c2w[idx]).float().to(device) #取当前全景的位姿
                     adj = adjust_pano_pose(pose_adjust, pano_c2w_t,
-                                           grid_pos[idx])[0]  # [4,4]
-                    faces_t = []
-                    for d in FACE_DIRS.values():
+                                           grid_pos[idx])[0]  # [4,4]  #修正后的全景位姿
+                    faces_t = []  #从修正后的位姿计算6个面的位姿
+                    for d in FACE_DIRS.values():  
                         Rf = torch.from_numpy(face_rotation(d)).float().to(device)
                         out = torch.eye(4, device=device)
                         out[:3, :3] = adj[:3, :3] @ Rf.T
@@ -670,9 +683,9 @@ def main():
                     c2ws.append(torch.stack(faces_t))
                 else:
                     c2ws.append(torch.from_numpy(face_c2w[idx]).float())
-                Ks_list.append(Ks_cur.to(device))
-                H, W = S_cur, S_cur
-            else:
+                Ks_list.append(Ks_cur.to(device))  #每个面的内参
+                H, W = S_cur, S_cur #照片尺寸
+            else: #针孔相机
                 img = load_pano(pano_paths[idx]).to(device)     # [H, W, 3]
                 cam_cur = cam_by_id[images[idx]["camera_id"]]
                 K0 = torch.from_numpy(camera_K(cam_cur)).float().to(device)
@@ -691,21 +704,22 @@ def main():
                     c2ws.append(torch.from_numpy(face_c2w[idx]).float())
                 Ks_list.append(K0.unsqueeze(0))
                 H, W = img.shape[0], img.shape[1]
-        gt = torch.cat(gts, dim=0).to(device)            # [B*faces, H, W, 3]
-        camtoworlds = torch.cat(c2ws, dim=0).to(device)  # [B*faces, 4, 4]
-        Ks_b = torch.cat(Ks_list, dim=0).to(device)      # [B*faces, 3, 3]
+        gt = torch.cat(gts, dim=0).to(device)            # [B*faces, H, W, 3] 分幅出的真实图像
+        camtoworlds = torch.cat(c2ws, dim=0).to(device)  # [B*faces, 4, 4] 分幅后的相机位姿
+        Ks_b = torch.cat(Ks_list, dim=0).to(device)      # [B*faces, 3, 3] 分幅后的内参
         # bilagrid 网格索引：全景按面、透视按图（每个训练视角独立网格）
         if bil_grids is not None:
-            grid_ids = []
-            for idx in idxs:
+            grid_ids = []   #双边网格的编号
+            for idx in idxs:  #为相机视角加上训练的双边网格
                 pos = grid_pos[idx]
                 for f in range(faces_per_image):
-                    grid_ids.append(pos * faces_per_image + f)
+                    grid_ids.append(pos * faces_per_image + f)  # pos*6+f f=0-5·
             grid_ids = torch.tensor(grid_ids, device=device)
 
         sh_degree = min(step // 1000, cfg.sh_degree)   #3000步以下用低阶分量
         colors = torch.cat([splats["sh0"], splats["shN"]], dim=1)
         render_mode = "RGB+ED" if cfg.depth_supervision_weight > 0.0 else "RGB"
+        #renders[B·6,S,S,4]颜色/深度  alphas[B·6,S,S,1]累计不透明度 info光栅化中间信息
         renders, alphas, info = rasterization(
             means=splats["means"],
             quats=splats["quats"],
@@ -737,20 +751,20 @@ def main():
         if ppisp is not None:
             cam_ids, frm_ids = [], []
             for idx in idxs:
-                pos = grid_pos[idx]
+                pos = grid_pos[idx]  #网格的编号
                 for f in range(faces_per_image):
                     if cfg.ppisp_mode == "hybrid":
-                        cam_ids.append(f if is_pano else 0)
-                        frm_ids.append(pos)
-                    else:
+                        cam_ids.append(f if is_pano else 0)  #每面一个相机  用来存渐晕和CRF
+                        frm_ids.append(pos)  #每个网格一个帧  用来存曝光和白平衡
+                    else:  #另一个per_view模式一张图为一帧一个相机
                         cam_ids.append(pos * faces_per_image + f)
                         frm_ids.append(pos * faces_per_image + f)
             rgb_corr = []
             for ci in range(colors_rgb.shape[0]):
                 rgb_corr.append(ppisp(
                     colors_rgb[ci], pixel_coords=None, resolution=(W, H),
-                    camera_idx=cam_ids[ci], frame_idx=frm_ids[ci]))
-            colors_rgb = torch.stack(rgb_corr)
+                    camera_idx=cam_ids[ci], frame_idx=frm_ids[ci]))  #校正后的rgb
+            colors_rgb = torch.stack(rgb_corr)  #覆盖原值
 
         # bilagrid 曝光/白平衡：渲染结果按像素坐标和灰度切网格做仿射变换
         if bil_grids is not None:
@@ -759,12 +773,12 @@ def main():
                 (torch.arange(H, device=device) + 0.5) / H,
                 (torch.arange(W, device=device) + 0.5) / W,
                 indexing="ij",
-            )
+            )  #像素归一化网格
             grid_xy = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0)
-            grid_xy = grid_xy.expand(colors_rgb.shape[0], -1, -1, -1)
+            grid_xy = grid_xy.expand(colors_rgb.shape[0], -1, -1, -1) #广播到 12 个渲染面
             colors_rgb = bilagrid_slice(
                 bil_grids, grid_xy, colors_rgb, grid_ids.unsqueeze(-1)
-            )["rgb"]
+            )["rgb"]  #仿射变换
         # 随机背景：每步随机颜色，抑制透明漂浮物（类似 Spirula 的背景噪声热身）
         if cfg.random_bkgd:
             bkgd = torch.rand(1, 3, device=device)
@@ -782,48 +796,51 @@ def main():
         loss = (1 - cfg.ssim_lambda) * l1 + cfg.ssim_lambda * (1 - ssim)
         # 稀疏深度监督：渲染期望深度 ED 在观测像素处采样，做视差 L1
         if depths_ed is not None:
-            depthloss = torch.tensor(0.0, device=device)
-            n_used = 0
+            depthloss = torch.tensor(0.0, device=device)  #深度损失
+            n_used = 0   #本次训练使用面个数
             for j, idx in enumerate(idxs):
                 pos = grid_pos[idx]
                 for f in range(faces_per_image):
-                    ci = j * faces_per_image + f
+                    ci = j * faces_per_image + f   #当前渲染面的编号
                     # 稠密深度路径（MoGe）：逐像素视差 L1，深度>0 视为有效
-                    if dense_aligned is not None:
-                        d_map = dense_aligned[pos][f].to(device)  # [S,S]
-                        if S_cur != S:
+                    if dense_aligned is not None:  #有稠密深度 走稠密路径 优先走这个路径
+                        d_map = dense_aligned[pos][f].to(device)  # 第 pos 张全景第 f 个面的对齐 MoGe 深度（在原始全分辨率 S 上）
+                        if S_cur != S:  #粗分辨率阶段走这里
                             d_map = F.interpolate(
                                 d_map[None, None], size=(S_cur, S_cur),
                                 mode="bilinear", align_corners=False,
-                            )[0, 0]
-                        valid = (d_map > 0) & torch.isfinite(d_map)
-                        if valid.sum() < 100:
+                            )[0, 0]  #双线性插值获取稠密深度
+                        valid = (d_map > 0) & torch.isfinite(d_map)  #有效像素
+                        if valid.sum() < 100:  #有效像素不足100个，跳过
                             continue
-                        disp_gt = 1.0 / d_map[valid]
-                        disp_rend = 1.0 / depths_ed[ci, ..., 0][valid]
+                        disp_gt = 1.0 / d_map[valid]  #GT 视差 = 1/深度
+                        disp_rend = 1.0 / depths_ed[ci, ..., 0][valid]  #渲染视差 = 1/深度
                         depthloss = depthloss + F.l1_loss(disp_rend, disp_gt) * scene_scale
+                        #使用视差的原因是更符合感知和 SfM 误差模型，防止远处损失被稀释近处被夸大
                         n_used += 1
                         continue
-                    if is_pano:
-                        px_f, d_f = depth_train[pos][f]
+                    if is_pano:  #稀疏深度监督
+                        px_f, d_f = depth_train[pos][f]  #  稀疏监督数据 px_f[M, 2]该面稀疏点的像素坐标（u, v）
+                        #, d_f[M]对应的相机系欧氏距离（COLMAP 真值） M该面可见的稀疏点数
                     else:
                         px_f, d_f = depth_train[pos]
                     if len(px_f) < 5:
                         continue
-                    if is_pano and S_cur != S:
+                    if is_pano and S_cur != S:  #粗分辨率阶段走这里
                         px_f = (S_cur / 2.0) + (px_f - S / 2.0) * (S_cur / S)
                     grid_d = torch.from_numpy(np.stack(
                         [px_f[:, 0] / (W - 1) * 2 - 1,
-                         px_f[:, 1] / (H - 1) * 2 - 1], -1)
+                         px_f[:, 1] / (H - 1) * 2 - 1], -1)  #归一化坐标到grid_sample格式
                     ).float().to(device).unsqueeze(0).unsqueeze(0)  # [1,1,M,2]
                     d_gt = torch.from_numpy(d_f).float().to(device)
+                   #用稀疏点的像素位置去渲染深度图里采样
                     d_rend = F.grid_sample(
                         depths_ed[ci:ci + 1].permute(0, 3, 1, 2), grid_d,
                         align_corners=True,
                     )[0, 0, 0, :]  # [M]
                     disp = torch.where(
                         d_rend > 0, 1.0 / d_rend, torch.zeros_like(d_rend)
-                    )
+                    )  #渲染视差 = 1/深度
                     depthloss = depthloss + F.l1_loss(disp, 1.0 / d_gt) * scene_scale
                     n_used += 1
             if n_used > 0:

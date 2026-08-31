@@ -380,11 +380,16 @@ def get_faces(pano_path: str, equirect: EquirectCamera, face_size: int,
 def build_sparse_depths(sparse: dict, images: list, face_rots=None,
                         S: int = 0, is_pano: bool = True,
                         c2w=None, pts=None) -> list:
+      #函数可能存在的问题
+      #1,||Xc|| vs Xc[2]必须与gsplat 渲染端深度输出方式一致。如果渲染输出的是 Z 深度，这里要改成 Xc[2]
+     #2像素中心约定：+f（不是 +f-0.5 或 +f+0.5），和 face_pixel_grid 的 arange + 0.5 配套
+     #位姿来源分支：c2w is not None 时用的是归一化场景下的位姿，对应归一化后的 points_xyz
+     #性能瓶颈 三重循环 np.append 的二次复制
     """Per-image sparse depth supervision from COLMAP observations.
 
     对每张图（或全景的每个面），取该图可见的稀疏 3D 点，把相机系距离
     （与 gsplat expected-depth 渲染一致）记录在对应像素坐标上。
-
+    
     返回:
       is_pano=True : 每张全景一个 list[6]，元素 (px [M,2], depth [M])
       is_pano=False: 每张图一个 (px [M,2], depth [M])
@@ -406,14 +411,14 @@ def build_sparse_depths(sparse: dict, images: list, face_rots=None,
             per_face = []
             for _ in range(len(face_rots)):
                 per_face.append((np.zeros((0, 2)), np.zeros(0)))
-            for k in range(len(im["point3D_ids"])):
+            for k in range(len(im["point3D_ids"])):  #把每个3D点分到6个面，这不得老慢了
                 pid = im["point3D_ids"][k]
                 if pid < 0:
-                    continue
-                Xc = R @ pts[id_to_idx[int(pid)]] + t
+                    continue  #point3D_id == -1 表示该 2D 观测没有对应的三角化点
+                Xc = R @ pts[id_to_idx[int(pid)]] + t  #每个3D点投影到6个面的面坐标系
                 depth = float(np.linalg.norm(Xc))
                 for fi, R_face in enumerate(face_rots):
-                    Xf = R_face @ Xc
+                    Xf = R_face @ Xc  #每个3D点投影到6个面的像素坐标系
                     if Xf[2] <= 0:
                         continue
                     f = S / 2.0
@@ -426,7 +431,7 @@ def build_sparse_depths(sparse: dict, images: list, face_rots=None,
                             np.append(d, depth),
                         )
             out.append(per_face)
-        else:
+        else:  #单张图像直接服用colmap的2D观测
             px, d = [], []
             for k in range(len(im["point3D_ids"])):
                 pid = im["point3D_ids"][k]
