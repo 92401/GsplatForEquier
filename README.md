@@ -1,0 +1,2 @@
+# GsplatForEquier
+基于gsplat开发适配分幅和不分辐数据训练方法
