@@ -66,6 +66,10 @@ pano_gsplat/
 ├── check.py           验证入口：切面自洽性 / 与 SfM 观测一致性
 ├── diag.py            诊断入口：高斯尺度/不透明度/位置分布 + 相机轨迹基线
 ├── gen_depth_moge.py  MoGe-2 稠密深度生成（每张全景 6 个面各一张深度 .pt）
+├── geo.py             地理坐标转换库（WGS84/UTM/ENU、相似变换、航姿转换，
+│                      零第三方依赖，`python geo.py --selftest` 自检）
+├── gen_geo_data.py    伪地理坐标数据生成器（COLMAP 局部坐标 → RTK 轨迹
+│                      + 带地理坐标的 sparse，供地理链路开发测试）
 ├── lib_bilagrid.py    第三方：3D bilateral grid（Apache-2.0，gsplat examples 原样拷贝）
 ├── configs/           配置示例（example.yaml）
 ├── requirements.txt   依赖清单
@@ -215,7 +219,28 @@ C:\Users\syk\.conda\envs\gsplat\python.exe diag.py outputs\full\ckpt_final.pt
 C:\Users\syk\.conda\envs\gsplat\python.exe gen_depth_moge.py `
   --data-dir D:\gaussian_splatting\spirula --face-size 512 `
   --out-dir D:\gaussian_splatting\spirula\depths
+
+# 坐标转换库自检（WGS84/UTM/ENU/相似变换/航姿）
+C:\Users\syk\.conda\envs\gsplat\python.exe geo.py --selftest
+
+# 伪地理坐标数据生成：把空三局部坐标绑定到真实经纬度，
+# 输出 rtk_traj.csv + 带地理坐标的 sparse/0（可被训练直接消费）
+C:\Users\syk\.conda\envs\gsplat\python.exe gen_geo_data.py `
+  --data-dir D:\gaussian_splatting\spirula `
+  --out-dir outputs\geo --lat 30.6599 --lon 104.0633 --alt 500
 ```
+
+`gen_geo_data.py` 生成的 `outputs\geo\` 包含：
+
+- `rtk_traj.csv`：模拟 RTK/卫惯输出（时间戳+经纬度+高程+航向/俯仰/横滚+四元数）；
+- `enu_traj.csv`：ENU 轨迹（调试用）；
+- `transform.json`：局部坐标 → ENU 的相似变换参数；
+- `sparse/0/`：变换到 ENU 坐标系的 COLMAP sparse，可直接用
+  `--data-dir outputs\geo --image-dir <原图目录>` 训练。
+
+在真实 RTK 盒子数据到位前，用这套数据开发"RTK↔空三坐标转换、带地理坐标的
+PLY/OBJ 导出"等地理链路模块；`geo.fit_similarity` 可从局部相机中心与 RTK
+轨迹拟合出该相似变换（RMS 达 1e-5 米量级）。
 
 ## 12. 参数详解
 
