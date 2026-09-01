@@ -33,6 +33,8 @@
 | 粗到细 | 先低分辨率面热身，再切完整分辨率，省显存加速收敛 |
 | 面缓存 | 重采样后的面缓存到磁盘（uint8 .pt），重复实验省时间 |
 | 配置文件 | JSON/YAML 配置加载，命令行参数优先，支持导出生效配置 |
+| 漂浮物清理 | 训练后处理：DBSCAN 最大簇 + 半径/统计离群点去除 + AABB 裁剪，
+               GS-safe 保存（PointNuker 核心算法内嵌，可当库 import） |
 ## 3. 技术路线
 
 ```text
@@ -63,6 +65,9 @@ pano_gsplat/
 ├── check.py           验证入口：切面自洽性 / 与 SfM 观测一致性
 ├── diag.py            诊断入口：高斯尺度/不透明度/位置分布 + 相机轨迹基线
 ├── gen_depth_moge.py  MoGe-2 稠密深度生成（每张全景 6 个面各一张深度 .pt）
+├── clean_floaters.py  漂浮物清理：PointNuker 核心算法内嵌（DBSCAN 最大簇、
+│                      半径/统计离群点去除、AABB 裁剪、GS-safe 保存），
+│                      可 `from clean_floaters import clean_ply` 当库用
 ├── geo.py             地理坐标转换库（WGS84/UTM/ENU、相似变换、航姿转换，
 │                      零第三方依赖，`python geo.py --selftest` 自检）
 ├── gen_geo_data.py    伪地理坐标数据生成器（COLMAP 局部坐标 → RTK 轨迹
@@ -204,6 +209,21 @@ C:\Users\syk\.conda\envs\gsplat\python.exe geo.py --selftest
 C:\Users\syk\.conda\envs\gsplat\python.exe gen_geo_data.py `
   --data-dir D:\gaussian_splatting\spirula `
   --out-dir outputs\geo --lat 30.6599 --lon 104.0633 --alt 500
+
+# 漂浮物清理：DBSCAN 只保留最大簇（自动建议 eps），清掉远处零星漂浮点
+C:\Users\syk\.conda\envs\gsplat\python.exe clean_floaters.py `
+  --ply outputs\run\splat.ply --keep-main-cluster --auto-eps
+
+# 组合清理：低不透明度 + 半径/统计离群点 + AABB + 最大簇，各步骤可自由开关
+C:\Users\syk\.conda\envs\gsplat\python.exe clean_floaters.py `
+  --ply outputs\run\splat.ply --out outputs\run\splat_clean.ply `
+  --min-opacity 0.01 --radius-outlier --radius 0.02 --min-k 16 `
+  --stat-outlier --stat-k 20 --n-sigmas 1.5 `
+  --aabb-min=-10,-10,-10 --aabb-max=10,10,10 `
+  --keep-main-cluster --eps 0.5
+
+# 合成数据自检（主簇 + 漂浮物，验证清理与属性无损）
+C:\Users\syk\.conda\envs\gsplat\python.exe clean_floaters.py --selftest
 ```
 
 ## 11. 参数详解
@@ -311,6 +331,21 @@ C:\Users\syk\.conda\envs\gsplat\python.exe gen_geo_data.py `
 | `--save-every` | 0 | 每 N 步保存 ckpt+ply（0=只在最后） |
 | `--preview-every` | 0 | 每 N 步保存 GT\|渲染对比图 |
 
+### 11.11 漂浮物清理（clean_floaters.py）
+
+| 参数 | 默认值 | 含义 |
+|---|---|---|
+| `--ply` | 必填 | 输入 splat.ply（gsplat 导出的训练产物） |
+| `--out` | 同目录 `splat_clean.ply` | 输出 PLY（GS-safe：属性一个不少） |
+| `--dry-run` | 关 | 只统计删多少、不写文件 |
+| `--min-opacity` | 0 | 删除 sigmoid(opacity)<阈值 的低透明度高斯 |
+| `--radius-outlier`/`--radius`/`--min-k` | 关 / 0.02 / 16 | 半径球内邻居数（含自身）少于 min-k 的点删除 |
+| `--stat-outlier`/`--stat-k`/`--n-sigmas` | 关 / 20 / 1.5 | k-NN 平均距离超过 全局均值+σ×n 的点删除 |
+| `--aabb-min`/`--aabb-max` | 无 | 只保留框内点；负值请用 `--aabb-min=-5,-5,-5` 的 = 形式 |
+| `--keep-main-cluster`/`--eps`/`--min-points` | 关 / 无 / 20 | DBSCAN 聚类只保留最大簇（PointNuker 主功能） |
+| `--auto-eps` | 关 | 自动建议 eps：k-NN 平均距离的高分位数（省得手调） |
+| `--dbscan-max-n` | 1000000 | 点云超过该数先抽样聚类、再按距离回贴（10M 点约 30 秒） |
+
 ## 12. 关键概念说明
 
 - **分幅（face split）**：等距柱状图直接光栅化会有极点畸变，项目按 Spirula
@@ -325,6 +360,10 @@ C:\Users\syk\.conda\envs\gsplat\python.exe gen_geo_data.py `
   sparse-grad 让反向只更新“本步被光栅化到的”高斯，两者配合能显著降低显存。
 - **PPISP 两种绑定**：`per_view` 每张面独立一套光度参数（自由度大、易过拟合）；
   `hybrid` 曝光/白平衡按全景共享、晕影/CRF 按面方向（物理更合理、参数更稳）。
+- **漂浮物清理**：训练后对高斯中心做 DBSCAN 聚类保留最大簇，再按需做半径/
+  统计离群点去除与 AABB 裁剪；PLY 只按行删，SH/opacity/scale/rot 全部原样保留
+  （GS-safe）。核心算法内嵌在 `clean_floaters.py`，可当库
+  `from clean_floaters import clean_ply` 用，也可命令行直接跑。
 ## 14. 修复记录（重要）
 
 1. **像素中心约定**：GT 重采样改为像素中心（u = i + 0.5），与 gsplat 光栅化

@@ -3,6 +3,7 @@ gsplat>=1.5
 torch
 numpy
 scikit-learn
+plyfile
 imageio
 fused-ssim
 torchmetrics
