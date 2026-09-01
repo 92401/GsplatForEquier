@@ -35,6 +35,8 @@
 | 配置文件 | JSON/YAML 配置加载，命令行参数优先，支持导出生效配置 |
 | 漂浮物清理 | 训练后处理：DBSCAN 最大簇 + 半径/统计离群点去除 + AABB 裁剪，
                GS-safe 保存（PointNuker 核心算法内嵌，可当库 import） |
+| 高斯转 OBJ | 训练后处理：多视角渲染 RGB+深度 → 反投影 → TSDF 融合 →
+               Marching Cubes → OBJ/PLY（全景 6 面与透视都支持） |
 ## 3. 技术路线
 
 ```text
@@ -68,6 +70,9 @@ pano_gsplat/
 ├── clean_floaters.py  漂浮物清理：PointNuker 核心算法内嵌（DBSCAN 最大簇、
 │                      半径/统计离群点去除、AABB 裁剪、GS-safe 保存），
 │                      可 `from clean_floaters import clean_ply` 当库用
+├── gs_to_obj.py       高斯转网格：多视角 RGB+ED 深度渲染 → 反投影点云 →
+│                      TSDF 融合（numpy 自实现）→ Marching Cubes → OBJ；
+│                      支持全景 6 面 / 透视，ours / gsplat 两种归一化
 ├── geo.py             地理坐标转换库（WGS84/UTM/ENU、相似变换、航姿转换，
 │                      零第三方依赖，`python geo.py --selftest` 自检）
 ├── gen_geo_data.py    伪地理坐标数据生成器（COLMAP 局部坐标 → RTK 轨迹
@@ -224,6 +229,20 @@ C:\Users\syk\.conda\envs\gsplat\python.exe clean_floaters.py `
 
 # 合成数据自检（主簇 + 漂浮物，验证清理与属性无损）
 C:\Users\syk\.conda\envs\gsplat\python.exe clean_floaters.py --selftest
+
+# 高斯转 OBJ（本项目 train.py 训出的模型，坐标归一化一致）
+C:\Users\syk\.conda\envs\gsplat\python.exe gs_to_obj.py `
+  --ply outputs\run\splat_clean.ply `
+  --data-dir D:\gaussian_splatting\spirula `
+  --face-size 512 --voxel-size 0.02 --out-dir outputs\run\mesh
+
+# gsplat simple_trainer 训出的模型（garden 等，factor=2 匹配 images_2）
+C:\Users\syk\.conda\envs\gsplat\python.exe gs_to_obj.py `
+  --ply ...\splat.ply --data-dir ...\garden `
+  --normalize gsplat --factor 2 --render-size 800
+
+# 合成数据自检（平面场景全流程）
+C:\Users\syk\.conda\envs\gsplat\python.exe gs_to_obj.py --selftest
 ```
 
 ## 11. 参数详解
@@ -346,6 +365,27 @@ C:\Users\syk\.conda\envs\gsplat\python.exe clean_floaters.py --selftest
 | `--auto-eps` | 关 | 自动建议 eps：k-NN 平均距离的高分位数（省得手调） |
 | `--dbscan-max-n` | 1000000 | 点云超过该数先抽样聚类、再按距离回贴（10M 点约 30 秒） |
 
+### 11.12 高斯转 OBJ（gs_to_obj.py）
+
+| 参数 | 默认值 | 含义 |
+|---|---|---|
+| `--ply` | 必填 | 输入 splat.ply |
+| `--data-dir` | 必填 | COLMAP sparse 所在数据集目录（提供相机位姿） |
+| `--normalize` | ours | 相机归一化：`ours`=本项目 train.py；`gsplat`=gsplat simple_trainer |
+| `--factor` | 1 | 图片下采样倍数（gsplat 数据集的 images_2 对应 2） |
+| `--face-size` | 512 | 全景切面边长（6 面各渲染一张深度） |
+| `--max-images` | 0 | 最多用 N 张图（0=全部；全景每张算 6 面） |
+| `--render-size` | 0 | 渲染宽度（0=相机原始尺寸；小值省显存/时间） |
+| `--voxel-size` | 0 | TSDF 体素尺寸（0=按场景 bbox/200 自动） |
+| `--trunc-mult` | 4 | TSDF 截断距离 = 体素 × 倍数（越大表面越连续） |
+| `--alpha-thresh` | 0.5 | 深度可靠像素的最低 alpha |
+| `--near-plane` | 0.05 | 近裁剪面（相机穿行场景时调大，跳过贴身高斯） |
+| `--grid-max-dist-mult` | 8 | 网格只覆盖“中位距离 × 倍数”内的主体（忽略飞点/远景） |
+| `--max-voxels` | 30000000 | 体素数上限（超出自动调粗） |
+| `--keep-largest` | 关 | 只保留最大连通分量（去壳/碎片） |
+| `--strip-dist` | 0 | 剥离贴网格边界的面（>0 生效） |
+| `--save-depth`/`--save-points` | 关 | 额外保存深度图 npz / 彩色点云 PLY |
+
 ## 12. 关键概念说明
 
 - **分幅（face split）**：等距柱状图直接光栅化会有极点畸变，项目按 Spirula
@@ -364,6 +404,11 @@ C:\Users\syk\.conda\envs\gsplat\python.exe clean_floaters.py --selftest
   统计离群点去除与 AABB 裁剪；PLY 只按行删，SH/opacity/scale/rot 全部原样保留
   （GS-safe）。核心算法内嵌在 `clean_floaters.py`，可当库
   `from clean_floaters import clean_ply` 用，也可命令行直接跑。
+- **高斯转 OBJ**：训练后从多视角渲染深度（gsplat 原生 RGB+ED 模式），深度反
+  投影为点云后用 TSDF 体素融合（sdf=depth-z，截断加权平均），Marching Cubes
+  提零等值面导出 OBJ。**适用前提是相机在场景外部环绕**（建筑外景、物体扫描）；
+  若相机在场景内部（室内定点全景、人持机穿行植物），TSDF 看不到表面背面，
+  网格会碎片化，需要 2DGS/GOF 类训练端方案。
 ## 14. 修复记录（重要）
 
 1. **像素中心约定**：GT 重采样改为像素中心（u = i + 0.5），与 gsplat 光栅化
@@ -381,3 +426,5 @@ C:\Users\syk\.conda\envs\gsplat\python.exe clean_floaters.py --selftest
 - 无掩膜（SAM/几何模板）、无法线监督、无浏览器 viewer；
 - 8GB 显存下大场景增密后显存吃紧，可先用 packed+sparse-grad 缓解
   （主机卸载实验见 `host-offload` 分支）。
+- 高斯转 OBJ（TSDF 路线）要求相机在场景外部；室内/穿行数据请先评估
+  （`--grid-max-dist-mult` 限定主体范围可缓解远景污染）。

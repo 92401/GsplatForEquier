@@ -4,6 +4,8 @@ torch
 numpy
 scikit-learn
 plyfile
+scikit-image
+trimesh
 imageio
 fused-ssim
 torchmetrics
