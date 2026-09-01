@@ -1,7 +1,7 @@
 # GsplatForEquier（pano_gsplat）— 等距柱状/透视 3DGS 训练器
 
 基于 gsplat 渲染内核开发的 3D 高斯泼溅（3DGS）训练器，适配**分幅（等距柱状
-全景）**和**不分幅（透视）**两类数据。技术路线参考 Spirula Studio 的 360
+全景）和不分幅（透视）两类数据。技术路线参考 Spirula Studio 的 360
 方案：等距柱状相机 → 6 面透视切分 → 稀疏点初始化 → 训练，同时支持普通透视
 相机数据集。
 
@@ -21,7 +21,6 @@
 |---|---|
 | 等距柱状全景训练 | 每张 360 影像切成 6 个 90° 针孔面（`warp_pano_to_faces`），与 Spirula 同路线 |
 | 透视相机训练 | COLMAP model 0-4（PINHOLE 族）直接用原图 + 相机内参，不切面 |
-| 稀疏点初始化 | 高斯位置=稀疏点坐标、颜色→SH0、尺度=4-NN 距离，不透明度 0.1/0.5 |
 | 双增密策略 | `DefaultStrategy`（Inria clone/split）与 `MCMCStrategy`（MCMC 增密） |
 | AbsGS | 用绝对 2D 梯度做增密，恢复细碎细节（配合 default 策略） |
 | 显存优化 | `--packed` 打包光栅化 + `--sparse-grad` 稀疏梯度，省显存 |
@@ -34,8 +33,6 @@
 | 粗到细 | 先低分辨率面热身，再切完整分辨率，省显存加速收敛 |
 | 面缓存 | 重采样后的面缓存到磁盘（uint8 .pt），重复实验省时间 |
 | 配置文件 | JSON/YAML 配置加载，命令行参数优先，支持导出生效配置 |
-| 诊断工具 | `check.py` 切面自洽性校验、`diag.py` 模型统计诊断 |
-
 ## 3. 技术路线
 
 ```text
@@ -83,27 +80,18 @@ pano_gsplat/
 建议直接使用现有的 `gsplat` conda 环境：
 
 ```powershell
-C:\Users\syk\.conda\envs\gsplat\python.exe
+...\.conda\envs\gsplat\python.exe
 ```
 
 需要安装的依赖（见 `requirements.txt`）：
-
-- Python 3.10
-- PyTorch 2.2.2+cu118（或其他 CUDA 版本，需与 gsplat 编译版本一致）
-- gsplat 1.5.x（渲染内核）
-- numpy、scikit-learn（KNN 初始化）、imageio（图片读写）
-- fused-ssim（SSIM 损失）
-- torchmetrics（验证集 PSNR/SSIM/LPIPS 评测，可选但建议）
-
 ### 5.2 可选依赖
-
 **MoGe-2（稠密深度监督）**：Windows 可装版本，固定到 2025-11-02 的提交
 （主分支已是 MoGe-3，依赖 Triton 在 Windows 上不便）：
 
 ```powershell
-git clone https://github.com/microsoft/MoGe.git D:\gaussian_splatting\tools\MoGe
-git -C D:\gaussian_splatting\tools\MoGe checkout 07444410f1e33f402353b99d6ccd26bd31e469e8
-C:\Users\syk\.conda\envs\gsplat\python.exe -m pip install -e D:\gaussian_splatting\tools\MoGe
+git clone https://github.com/microsoft/MoGe.git your_path...\MoGe
+git -C ...\MoGe checkout 07444410f1e33f402353b99d6ccd26bd31e469e8
+...\.conda\envs\gsplat\python.exe -m pip install -e your_path...\MoGe
 ```
 
 **PPISP（光度校正）**：nv-tlabs/ppisp（Apache-2.0），需要编译 CUDA 扩展。
@@ -111,12 +99,12 @@ Windows 编译要点：VS2022（MSVC 14.44）的 STL 拒绝 CUDA<12.4，而 torc
 又禁止 CUDA 12.x 的 nvcc，因此必须用 VS2019（MSVC 14.29）+ CUDA 11.8 编译：
 
 ```powershell
-git clone https://github.com/nv-tlabs/ppisp.git D:\gaussian_splatting\tools\ppisp
+git clone https://github.com/nv-tlabs/ppisp.git your_path...\ppisp
 # 用 VS2019 的 vcvars64 环境 + DISTUTILS_USE_SDK=1 执行：
 #   python setup.py bdist_wheel
 # 然后安装生成的 wheel（--no-build-isolation）
-C:\Users\syk\.conda\envs\gsplat\python.exe -m pip install --force-reinstall --no-deps `
-  D:\gaussian_splatting\tools\ppisp\dist\ppisp-1.2.1-cp310-cp310-win_amd64.whl
+...\.conda\envs\gsplat\python.exe -m pip install --force-reinstall --no-deps `
+  your_path...\ppisp\dist\ppisp-1.2.1-cp310-cp310-win_amd64.whl
 ```
 
 ## 6. 数据要求
@@ -142,63 +130,51 @@ C:\Users\syk\.conda\envs\gsplat\python.exe -m pip install --force-reinstall --no
                图片尺寸与标定尺寸不一致时自动缩放 K
 ```
 
-参考数据：`D:\gaussian_splatting\spirula`（354 张全景）和
-`D:\gaussian_splatting\GGPS-data\datasets\FTP\gsplat_ftp`（透视 rig 图）。
-
-## 7. 快速开始（冒烟测试）
-
-```powershell
-cd D:\gaussian_splatting\pano_gsplat
-C:\Users\syk\.conda\envs\gsplat\python.exe train.py `
-  --data-dir D:\gaussian_splatting\spirula `
-  --max-images 4 --face-size 128 --steps 30 --out-dir outputs\smoke
-```
-
-## 8. 正式训练
+## 7. 正式训练
 
 全部 354 张全景、1024 面、3 万步、MCMC 增密（建议开面缓存）：
 
 ```powershell
-C:\Users\syk\.conda\envs\gsplat\python.exe train.py `
+python train.py `
   --data-dir D:\gaussian_splatting\spirula `
   --face-size 1024 --steps 30000 --strategy mcmc `
   --face-cache D:\gaussian_splatting\pano_gsplat\face_cache `
-  --out-dir D:\gaussian_splatting\pano_gsplat\outputs\full
+  --out-dir \outputs
 ```
 
 透视数据示例：
 
 ```powershell
-C:\Users\syk\.conda\envs\gsplat\python.exe train.py `
+python train.py `
   --data-dir D:\gaussian_splatting\GGPS-data\datasets\FTP\gsplat_ftp `
-  --steps 30000 --out-dir D:\gaussian_splatting\pano_gsplat\outputs\persp
+  --steps 30000 --out-dir \outputs
 ```
 
-## 9. 配置文件
+## 8. 配置文件
 
 支持 JSON 或 YAML，键 = 参数名（连字符键 `data-dir` 等价于 `data_dir`），
 **命令行显式参数优先于配置文件**。示例见 `configs/example.yaml`：
 
 ```powershell
 # 用配置跑（示例配置里已含 354 张全景的正式训练参数）
-C:\Users\syk\.conda\envs\gsplat\python.exe train.py --config configs\example.yaml
+python train.py --config configs\example.yaml
 
 # 覆盖个别参数（比如先小规模测试）
-C:\Users\syk\.conda\envs\gsplat\python.exe train.py `
+python train.py `
   --config configs\example.yaml --max-images 4 --face-size 256 --steps 300
 
 # 导出生效配置，方便保存/复用
-C:\Users\syk\.conda\envs\gsplat\python.exe train.py `
+\python train.py `
   --config configs\example.yaml --dump-config outputs\my_run.json
 ```
 
-## 10. 验证与评测
+## 9. 验证与评测
 
 训练时用 `--test-every N` 每 N 张留 1 张做验证集，`--eval-every` 周期评测，
 结果写入 `outputs/<run>/metrics.json`（PSNR/SSIM/LPIPS）：
 
 ```powershell
-C:\Users\syk\.conda\envs\gsplat\python.exe train.py `
+python train.py `
   --config configs\example.yaml --test-every 8 --eval-every 2000 `
   --save-eval-images
 ```
@@ -206,17 +182,17 @@ C:\Users\syk\.conda\envs\gsplat\python.exe train.py `
 `--save-eval-images` 会额外保存验证视图的 GT|渲染对比图
 （`eval_<step>_v<idx>.png`）。
 
-## 11. 工具脚本
+## 10. 工具脚本
 
 ```powershell
 # 切面自洽性校验（warp 重投影 / SfM 观测一致性），改动切面逻辑后必跑
-C:\Users\syk\.conda\envs\gsplat\python.exe check.py all
+python check.py all
 
 # 模型诊断：高斯尺度/不透明度/位置分布 + 相机轨迹基线统计
-C:\Users\syk\.conda\envs\gsplat\python.exe diag.py outputs\full\ckpt_final.pt
+python diag.py outputs\full\ckpt_final.pt
 
 # MoGe 稠密深度生成（每张全景 6 个面各一张度量深度 .pt）
-C:\Users\syk\.conda\envs\gsplat\python.exe gen_depth_moge.py `
+python gen_depth_moge.py `
   --data-dir D:\gaussian_splatting\spirula --face-size 512 `
   --out-dir D:\gaussian_splatting\spirula\depths
 
@@ -230,21 +206,9 @@ C:\Users\syk\.conda\envs\gsplat\python.exe gen_geo_data.py `
   --out-dir outputs\geo --lat 30.6599 --lon 104.0633 --alt 500
 ```
 
-`gen_geo_data.py` 生成的 `outputs\geo\` 包含：
+## 11. 参数详解
 
-- `rtk_traj.csv`：模拟 RTK/卫惯输出（时间戳+经纬度+高程+航向/俯仰/横滚+四元数）；
-- `enu_traj.csv`：ENU 轨迹（调试用）；
-- `transform.json`：局部坐标 → ENU 的相似变换参数；
-- `sparse/0/`：变换到 ENU 坐标系的 COLMAP sparse，可直接用
-  `--data-dir outputs\geo --image-dir <原图目录>` 训练。
-
-在真实 RTK 盒子数据到位前，用这套数据开发"RTK↔空三坐标转换、带地理坐标的
-PLY/OBJ 导出"等地理链路模块；`geo.fit_similarity` 可从局部相机中心与 RTK
-轨迹拟合出该相似变换（RMS 达 1e-5 米量级）。
-
-## 12. 参数详解
-
-### 12.1 基础参数
+### 11.1 基础参数
 
 | 参数 | 默认值 | 含义 |
 |---|---|---|
@@ -262,7 +226,7 @@ PLY/OBJ 导出"等地理链路模块；`geo.fit_similarity` 可从局部相机�
 | `--seed` | 42 | 随机种子（复现实验用） |
 | `--device` | cuda:0 | 训练设备 |
 
-### 12.2 渲染与损失
+### 11.2 渲染与损失
 
 | 参数 | 默认值 | 含义 |
 |---|---|---|
@@ -294,7 +258,7 @@ PLY/OBJ 导出"等地理链路模块；`geo.fit_similarity` 可从局部相机�
 说明：全景模式每步 6 面并行监督，优化器的 Adam 超参（lr/eps/betas）会按
 `sqrt(batch_size × 6)` 自动放大，保证 6 路并行监督下稳定收敛。
 
-### 12.5 增密与效率
+### 11.5 增密与效率
 
 | 参数 | 默认值 | 含义 |
 |---|---|---|
@@ -302,7 +266,7 @@ PLY/OBJ 导出"等地理链路模块；`geo.fit_similarity` 可从局部相机�
 | `--packed` | 关 | 打包光栅化：把“tile×槽位”稠密表改成扁平+偏移表，省掉空槽 |
 | `--sparse-grad` | 关 | 稀疏梯度：只给可见高斯保留梯度（需配合 `--packed`） |
 
-### 12.6 评测
+### 11.6 评测
 
 | 参数 | 默认值 | 含义 |
 |---|---|---|
@@ -311,14 +275,14 @@ PLY/OBJ 导出"等地理链路模块；`geo.fit_similarity` 可从局部相机�
 | `--eval-max-images` | 20 | 每次评测最多渲染的验证图数 |
 | `--save-eval-images` | 关 | 保存验证 GT\|渲染对比图 |
 
-### 12.7 粗到细
+### 11.7 粗到细
 
 | 参数 | 默认值 | 含义 |
 |---|---|---|
 | `--coarse-face-size` | 0 | 第一阶段面的边长（0=关闭粗到细） |
 | `--coarse-steps` | 0 | 多少步后从粗分辨率切到完整分辨率 |
 
-### 12.8 光度校正
+### 11.8 光度校正
 
 | 参数 | 默认值 | 含义 |
 |---|---|---|
@@ -329,14 +293,14 @@ PLY/OBJ 导出"等地理链路模块；`geo.fit_similarity` 可从局部相机�
 | `--ppisp-lr` | 0.002 | PPISP 主参数学习率 |
 | `--ppisp-reg-scale` | 1.0 | PPISP 正则损失权重 |
 
-### 12.9 深度监督
+### 11.9 深度监督
 
 | 参数 | 默认值 | 含义 |
 |---|---|---|
 | `--depth-supervision-weight` | 0 | 深度监督权重（>0 启用；用 COLMAP 稀疏观测深度） |
 | `--depth-dir` | 空 | MoGe 稠密深度目录（`gen_depth_moge.py` 输出），启用逐像素深度监督 |
 
-### 12.10 位姿 / 背景 / 缓存
+### 11.10 位姿 / 背景 / 缓存
 
 | 参数 | 默认值 | 含义 |
 |---|---|---|
@@ -347,7 +311,7 @@ PLY/OBJ 导出"等地理链路模块；`geo.fit_similarity` 可从局部相机�
 | `--save-every` | 0 | 每 N 步保存 ckpt+ply（0=只在最后） |
 | `--preview-every` | 0 | 每 N 步保存 GT\|渲染对比图 |
 
-## 13. 关键概念说明
+## 12. 关键概念说明
 
 - **分幅（face split）**：等距柱状图直接光栅化会有极点畸变，项目按 Spirula
   方案切成 6 个 90° 针孔面，每个面用普通 pinhole 相机渲染，6 面共享同一全景
@@ -361,22 +325,7 @@ PLY/OBJ 导出"等地理链路模块；`geo.fit_similarity` 可从局部相机�
   sparse-grad 让反向只更新“本步被光栅化到的”高斯，两者配合能显著降低显存。
 - **PPISP 两种绑定**：`per_view` 每张面独立一套光度参数（自由度大、易过拟合）；
   `hybrid` 曝光/白平衡按全景共享、晕影/CRF 按面方向（物理更合理、参数更稳）。
-
-## 14. 功能测试记录（短训验证）
-
-| 功能 | 说明 | 测试结果 |
-|---|---|---|
-| AbsGS + packed + sparse_grad | 绝对梯度增密 + 打包光栅化 + 稀疏梯度 | 60 步 loss 0.28→0.06，显存 0.76 GiB |
-| 验证集评测 | 留出验证图，周期渲染写 metrics.json | 90 步 PSNR 21.1→22.3 |
-| 粗到细 | 低分辨率热身再切高分辨率 | 128→256 切换正常，loss 持续下降 |
-| bilagrid | 逐视角曝光/白平衡校正 | 60 步 loss 0.28→0.055，SSIM 0.864 |
-| 深度监督 | 期望深度 ED + 视差 L1；MoGe 稠密深度可复用同一接口 | 训练正常，RGB 与基线持平 |
-| MoGe 稠密深度 | 按面与稀疏深度中位比例对齐，逐像素视差 L1 | 2 图 40 步训练正常 |
-| 位姿优化 | 全景 6 面共享位姿增量，不破坏 rig | 40 步 loss 0.28→0.07 |
-| 随机背景 | 每步随机背景色 | 与位姿优化同测通过 |
-| PPISP（per_view / hybrid） | 2000 步 spirula 三组对比（基线 24.39 / per_view 22.73 / hybrid 23.29） | hybrid 参数更稳、训练校正 +0.65 dB，但该数据光照一致，净收益为负 |
-
-## 15. 修复记录（重要）
+## 14. 修复记录（重要）
 
 1. **像素中心约定**：GT 重采样改为像素中心（u = i + 0.5），与 gsplat 光栅化
    和 Spirula 的 WarpFace 一致；早期角落约定导致 GT 与渲染错位半像素。
@@ -388,7 +337,7 @@ PLY/OBJ 导出"等地理链路模块；`geo.fit_similarity` 可从局部相机�
 4. **深度监督量纲**：统一用归一化后的位姿/点云计算深度，MoGe 稠密深度也按
    面与稀疏深度中位比例对齐到同一场景尺度。
 
-## 16. 已知限制
+## 15. 已知限制
 
 - 无掩膜（SAM/几何模板）、无法线监督、无浏览器 viewer；
 - 8GB 显存下大场景增密后显存吃紧，可先用 packed+sparse-grad 缓解
