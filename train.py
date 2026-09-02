@@ -171,6 +171,9 @@ def parse_args():
                    help="save ckpt+ply every N steps (0 = final only)")
     p.add_argument("--preview-every", type=int, default=0,
                    help="save GT|render montage every N steps")
+    p.add_argument("--loss-log-every", type=int, default=1,
+                   help="record loss history every N steps "
+                        "(saved to loss_history.csv/json at end)")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--dump-config", default="",
@@ -651,7 +654,10 @@ def main():
     B = cfg.batch_size  #每一步几张全景影像
     pbar_steps = cfg.steps
     tic = time.time()
+    loss_log = []  #训练过程 loss 历史（step/loss/l1/ssim/depth_loss/gs/mem/time）
     for step in range(pbar_steps):
+        depthloss = None  #预初始化：仅深度监督启用时才会被赋值，供 loss 日志读取
+        n_used = 0
         idxs = [random.choice(train_idx) for _ in range(B)]  #抽取B张训练影像 idx抽中的原始图像编号
         # 粗到细：切换当前面的尺寸与内参
         if is_pano and Ks_coarse is not None and step < cfg.coarse_steps:  #粗阶段
@@ -902,6 +908,19 @@ def main():
                   f"GS {len(splats['means'])} mem {mem:.2f} GiB "
                   f"time {time.time()-tic:.0f}s")
 
+        if step % cfg.loss_log_every == 0 or step == pbar_steps - 1:
+            dl = depthloss.item() if (depthloss is not None and n_used > 0) else 0.0
+            loss_log.append({
+                "step": step,
+                "loss": float(loss.item()),
+                "l1": float(l1.item()),
+                "ssim": float(ssim.item()),
+                "depth_loss": float(dl),
+                "gs": int(len(splats["means"])),
+                "mem_gib": float(torch.cuda.max_memory_allocated() / 1024 ** 3),
+                "time_s": float(time.time() - tic),
+            })
+
         if cfg.preview_every and (step % cfg.preview_every == 0
                                   or step == pbar_steps - 1):
             save_preview(gt, colors_rgb.detach(),
@@ -924,6 +943,19 @@ def main():
     if ppisp is not None:
         torch.save(ppisp.state_dict(),
                    os.path.join(cfg.out_dir, "ppisp_final.pt"))
+    if loss_log:  #训练过程 loss 历史落盘（CSV 方便 Excel/画图，JSON 方便程序读取）
+        import csv
+        import json
+        hist_csv = os.path.join(cfg.out_dir, "loss_history.csv")
+        with open(hist_csv, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=list(loss_log[0].keys()))
+            w.writeheader()
+            w.writerows(loss_log)
+        hist_json = os.path.join(cfg.out_dir, "loss_history.json")
+        with open(hist_json, "w", encoding="utf-8") as f:
+            json.dump(loss_log, f, indent=2)
+        print(f"[done] loss history → {hist_csv} / {hist_json} "
+              f"({len(loss_log)} entries)")
     print(f"[done] outputs in {cfg.out_dir}")
 
 
