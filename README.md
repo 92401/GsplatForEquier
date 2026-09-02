@@ -35,6 +35,9 @@
 | 配置文件 | JSON/YAML 配置加载，命令行参数优先，支持导出生效配置 |
 | loss 记录 | 训练全程记录 loss/l1/ssim/高斯数/显存/耗时，结束写
                `loss_history.csv` + `.json`（可 Excel 画收敛曲线） |
+| 绝对坐标输出 | `--export-absolute`：训练结束额外输出还原到输入坐标系的
+               `splat_absolute.ply`（若 sparse 为 ENU/UTM 绝对坐标即地理
+               坐标模型）+ `norm.json`（归一化 center/scale） |
 | 漂浮物清理 | 训练后处理：DBSCAN 最大簇 + 半径/统计离群点去除 + AABB 裁剪，
                GS-safe 保存（PointNuker 核心算法内嵌，可当库 import） |
 | 高斯转 OBJ | 训练后处理：多视角渲染 RGB+深度 → 反投影 → TSDF 融合 →
@@ -353,6 +356,10 @@ C:\Users\syk\.conda\envs\gsplat\python.exe gs_to_obj.py --selftest
 | `--preview-every` | 0 | 每 N 步保存 GT\|渲染对比图 |
 | `--loss-log-every` | 1 | 每 N 步记录一次 loss 历史（0 步起，含最后一步）；
                                结束写 `loss_history.csv`/`.json` 到输出目录 |
+| `--export-absolute` | 关 | 额外输出还原到输入坐标系的 `splat_absolute.ply`
+                               （位置 ÷scale + center，高斯线性尺度 ×1/scale；
+                               输入为 ENU/UTM 绝对坐标时即地理坐标模型）
+                               + `norm.json`（归一化参数，供后续映射） |
 
 ### 11.11 漂浮物清理（clean_floaters.py）
 

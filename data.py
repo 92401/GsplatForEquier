@@ -331,15 +331,24 @@ def build_camtoworlds(images):
     return np.stack(c2w, axis=0)
 
 
+def normalization_params(c2w: np.ndarray):
+    """只读：返回 normalize_world 使用的 (center, scale)，不修改输入。
+
+    p_norm = (p_raw - center) * scale，因此还原绝对坐标：
+    p_raw = p_norm / scale + center。若输入 sparse 本身就是 ENU/UTM 等
+    绝对坐标，还原后的模型即为地理坐标模型。
+    """
+    centers = np.asarray(c2w[:, :3, 3], np.float64)  #所有相机位置
+    center = centers.mean(axis=0)
+    scale = 1.0 / (np.linalg.norm(centers - center, axis=1).mean() + 1e-8)
+    return center, float(scale)
+
+
 def normalize_world(c2w: np.ndarray, points: np.ndarray):
     """Center cameras at origin and scale so mean camera radius ~ 1."""
-    centers = c2w[:, :3, 3]    #所有相机位置
-    center = centers.mean(axis=0)
-    centers -= center  #设置相机群的中心为0
-    scale = 1.0 / (np.linalg.norm(centers, axis=1).mean() + 1e-8)  #相机到原点的距离的平均值
-    centers *= scale  #让平均距离为1，保持相机群的大小不变
+    center, scale = normalization_params(c2w)
     c2w = c2w.copy()
-    c2w[:, :3, 3] = centers
+    c2w[:, :3, 3] = (c2w[:, :3, 3] - center) * scale
     points = (points - center) * scale #按照相机变化等同变化点的坐标，保持相对位置
     return c2w, points
 

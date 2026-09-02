@@ -42,6 +42,7 @@ from data import (
     get_faces,
     load_pano,
     load_sparse,
+    normalization_params,
     normalize_world,
     pinhole_intrinsics,
 )
@@ -174,6 +175,10 @@ def parse_args():
     p.add_argument("--loss-log-every", type=int, default=1,
                    help="record loss history every N steps "
                         "(saved to loss_history.csv/json at end)")
+    p.add_argument("--export-absolute", action="store_true",
+                   help="训练结束额外输出还原到输入坐标系的 splat_absolute.ply"
+                        "（若 sparse 为 ENU/UTM 等绝对坐标，即地理坐标模型）"
+                        " + norm.json（归一化 center/scale）")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--dump-config", default="",
@@ -493,6 +498,8 @@ def main():
 
     # ---- 2. world normalization + face camera table ----------------------
     c2w = build_camtoworlds(images)  #相机转世界
+    #归一化参数（center/scale），供 --export-absolute 还原绝对/输入坐标系
+    norm_center, norm_scale = normalization_params(c2w)
     c2w, points_xyz = normalize_world(c2w, points_xyz)  #归一化坐标
     scene_scale = np.linalg.norm(c2w[:, :3, 3], axis=1).max() * 1.1  #创建整个场景的尺度，尺度为归一化后的相机到原点的距离的最大值的1.1倍，确保所有相机都在场景内
     print(f"[data] normalized scene scale = {scene_scale:.4f}")
@@ -943,6 +950,36 @@ def main():
     if ppisp is not None:
         torch.save(ppisp.state_dict(),
                    os.path.join(cfg.out_dir, "ppisp_final.pt"))
+    if cfg.export_absolute:
+        #还原到输入坐标系：位置除以 scale 再加 center；高斯线性尺度放大 1/scale
+        #（scales 是 log 空间参数，故 log 域加 -log(scale)）。无旋转，四元数不变。
+        import json as _json
+        norm_info = {
+            "center": [float(x) for x in norm_center],
+            "scale": float(norm_scale),
+            "note": "p_raw = p_norm / scale + center；若输入 sparse 为 "
+                    "ENU/UTM 等绝对坐标，splat_absolute.ply 即地理坐标模型",
+        }
+        norm_path = os.path.join(cfg.out_dir, "norm.json")
+        with open(norm_path, "w", encoding="utf-8") as f:
+            _json.dump(norm_info, f, indent=2)
+        means_abs = splats["means"].detach() / norm_scale + torch.from_numpy(
+            norm_center
+        ).float().to(device)
+        scales_abs = splats["scales"].detach() - math.log(norm_scale)
+        abs_path = os.path.join(cfg.out_dir, "splat_absolute.ply")
+        export_splats(
+            means=means_abs,
+            scales=scales_abs,
+            quats=splats["quats"].detach(),
+            opacities=splats["opacities"].detach(),
+            sh0=splats["sh0"].detach(),
+            shN=splats["shN"].detach(),
+            format="ply",
+            save_to=abs_path,
+        )
+        print(f"[done] absolute-coordinate model → {abs_path}")
+        print(f"[done] normalization params → {norm_path}")
     if loss_log:  #训练过程 loss 历史落盘（CSV 方便 Excel/画图，JSON 方便程序读取）
         import csv
         import json
