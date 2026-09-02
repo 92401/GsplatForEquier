@@ -1,6 +1,6 @@
-# GsplatForEquier（pano_gsplat）— 等距柱状/透视 3DGS 训练器
+# GsplatForEquier— 等距柱状/透视 3DGS 训练器
 
-基于 gsplat 渲染内核开发的 3D 高斯泼溅（3DGS）训练器，适配**分幅（等距柱状
+基于 gsplat 渲染内核开发的 3D 高斯泼溅（3DGS）训练器，适配分幅（等距柱状
 全景）和不分幅（透视）两类数据。技术路线参考 Spirula Studio 的 360
 方案：等距柱状相机 → 6 面透视切分 → 稀疏点初始化 → 训练，同时支持普通透视
 相机数据集。
@@ -33,15 +33,10 @@
 | 粗到细 | 先低分辨率面热身，再切完整分辨率，省显存加速收敛 |
 | 面缓存 | 重采样后的面缓存到磁盘（uint8 .pt），重复实验省时间 |
 | 配置文件 | JSON/YAML 配置加载，命令行参数优先，支持导出生效配置 |
-| loss 记录 | 训练全程记录 loss/l1/ssim/高斯数/显存/耗时，结束写
-               `loss_history.csv` + `.json`（可 Excel 画收敛曲线） |
-| 绝对坐标输出 | `--export-absolute`：训练结束额外输出还原到输入坐标系的
-               `splat_absolute.ply`（若 sparse 为 ENU/UTM 绝对坐标即地理
-               坐标模型）+ `norm.json`（归一化 center/scale） |
-| 漂浮物清理 | 训练后处理：DBSCAN 最大簇 + 半径/统计离群点去除 + AABB 裁剪，
-               GS-safe 保存（PointNuker 核心算法内嵌，可当库 import） |
-| 高斯转 OBJ | 训练后处理：多视角渲染 RGB+深度 → 反投影 → TSDF 融合 →
-               Marching Cubes → OBJ/PLY（全景 6 面与透视都支持） |
+| loss 记录 | 训练全程记录 loss/l1/ssim/高斯数/显存/耗时，结束写 `loss_history.csv` + `.json`（可 Excel 画收敛曲线） |
+| 绝对坐标输出 | `--export-absolute`：额外输出还原到输入坐标系的 `splat_absolute.ply`（ENU/UTM 绝对坐标 sparse 即地理坐标模型）+ `norm.json` |
+| 漂浮物清理 | DBSCAN 最大簇 + 半径/统计离群点去除 + AABB 裁剪，GS-safe 保存（PointNuker 算法内嵌，可 import） |
+| 高斯转 OBJ | 多视角 RGB+深度渲染 → TSDF 融合 → Marching Cubes → OBJ/PLY（需相机外部环绕观测） |
 ## 3. 技术路线
 
 ```text
@@ -354,12 +349,8 @@ C:\Users\syk\.conda\envs\gsplat\python.exe gs_to_obj.py --selftest
 | `--face-cache` | 空 | 把重采样后的面缓存到磁盘（uint8 .pt），重跑省时间 |
 | `--save-every` | 0 | 每 N 步保存 ckpt+ply（0=只在最后） |
 | `--preview-every` | 0 | 每 N 步保存 GT\|渲染对比图 |
-| `--loss-log-every` | 1 | 每 N 步记录一次 loss 历史（0 步起，含最后一步）；
-                               结束写 `loss_history.csv`/`.json` 到输出目录 |
-| `--export-absolute` | 关 | 额外输出还原到输入坐标系的 `splat_absolute.ply`
-                               （位置 ÷scale + center，高斯线性尺度 ×1/scale；
-                               输入为 ENU/UTM 绝对坐标时即地理坐标模型）
-                               + `norm.json`（归一化参数，供后续映射） |
+| `--loss-log-every` | 1 | 每 N 步记录一次 loss（0 步起含最后一步），结束写 `loss_history.csv`/`.json` |
+| `--export-absolute` | 关 | 额外输出输入坐标系的 `splat_absolute.ply`（位置还原 + 尺度×1/scale）+ `norm.json` |
 
 ### 11.11 漂浮物清理（clean_floaters.py）
 
