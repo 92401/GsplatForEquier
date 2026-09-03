@@ -104,17 +104,63 @@ git -C ...\MoGe checkout 07444410f1e33f402353b99d6ccd26bd31e469e8
 ...\.conda\envs\gsplat\python.exe -m pip install -e your_path...\MoGe
 ```
 
-**PPISP（光度校正）**：nv-tlabs/ppisp（Apache-2.0），需要编译 CUDA 扩展。
-Windows 编译要点：VS2022（MSVC 14.44）的 STL 拒绝 CUDA<12.4，而 torch cu118
-又禁止 CUDA 12.x 的 nvcc，因此必须用 VS2019（MSVC 14.29）+ CUDA 11.8 编译：
+**PPISP（光度校正）**：nv-tlabs/ppisp（Apache-2.0），做逐视角/逐面的曝光、
+晕影、颜色与 CRF 校正（用法见 11.8 节 `--ppisp` / `--ppisp-mode`）。
+
+它和 gsplat 一样是**独立安装的 CUDA 扩展包**：ppisp 源码只在“构建”时用到，
+不需要拷进本项目；训练代码通过 `from ppisp import PPISP, PPISPConfig` 直接
+导入 site-packages 里的已装包。因为上游没有 PyPI wheel，且 CUDA 扩展不能跨
+Python 版本 / GPU 架构复用，所以每台机器都要用本机工具链编译一次。
+
+前置条件（Windows）：
+- VS2019（MSVC 14.29）+ CUDA 11.8 + torch cu118：VS2022 的 STL 拒绝
+  CUDA<12.4，而 torch cu118 又禁止 CUDA 12.x 的 nvcc，因此必须 VS2019 +
+  CUDA 11.8 组合；
+- GPU 架构：默认自动探测本机 GPU。也可用 `TORCH_CUDA_ARCH_LIST` 指定，
+  例如 40 系 Ada 用 `8.9`、30 系 Ampere 用 `8.6`。注意 `sm_89` 的 wheel
+  只能在 RTX 40 系上运行，换 GPU 型号/Python 版本必须重新编译。
+
+推荐用脚本一次完成（改前两行路径即可）：
+
+```bat
+@echo off
+setlocal
+call "C:\Program Files (x86)\Microsoft Visual Studio\2019\Community\VC\Auxiliary\Build\vcvarsall.bat" x86_amd64
+if errorlevel 1 exit /b 1
+set DISTUTILS_USE_SDK=1
+rem 本机为 RTX 40 系；其它 GPU 删掉此行让 setup.py 自动探测
+set TORCH_CUDA_ARCH_LIST=8.9
+cd /d your_path\ppisp
+your_path\.conda\envs\gsplat\python.exe -m pip install . --no-build-isolation --no-deps
+```
+
+等价的手动步骤：
 
 ```powershell
 git clone https://github.com/nv-tlabs/ppisp.git your_path...\ppisp
-# 用 VS2019 的 vcvars64 环境 + DISTUTILS_USE_SDK=1 执行：
-#   python setup.py bdist_wheel
-# 然后安装生成的 wheel（--no-build-isolation）
-...\.conda\envs\gsplat\python.exe -m pip install --force-reinstall --no-deps `
-  your_path...\ppisp\dist\ppisp-1.2.1-cp310-cp310-win_amd64.whl
+cd your_path...\ppisp
+# 先打开“VS2019 Developer Command Prompt”，或手动执行：
+#   call "C:\Program Files (x86)\Microsoft Visual Studio\2019\Community\VC\Auxiliary\Build\vcvarsall.bat" x86_amd64
+# set DISTUTILS_USE_SDK=1
+# set TORCH_CUDA_ARCH_LIST=8.9   （按本机 GPU 调整；也可省略=自动探测）
+...\.conda\envs\gsplat\python.exe -m pip install . --no-build-isolation --no-deps
+```
+
+常见编译问题：
+- `LNK1158: cannot run rc.exe`：链接器做 `/MANIFEST:EMBED` 时要调用 rc.exe。
+  最简单的修法是让扩展不嵌 manifest——在 ppisp 的 `setup.py` 中
+  `CUDAExtension(...)` 里加一行 `extra_link_args=["/MANIFEST:NO"]`
+  （Python 扩展 DLL 不需要 manifest）；或者把 Windows Kits 中 rc.exe 所在
+  目录（如 `C:\Program Files (x86)\Windows Kits\10\bin\<版本>\x64`）加进 PATH。
+- setuptools 自动探测可能选到不完整的 VS2022 BuildTools 环境（表现为编译
+  命令正常但环境变量残缺、链接阶段报错）：务必在 VS2019 vcvarsall 初始化后
+  的**同一个 shell** 里执行，并设 `DISTUTILS_USE_SDK=1` 让 setuptools 直接
+  采用当前环境而不是自己探测。
+
+验证安装：
+
+```powershell
+...\.conda\envs\gsplat\python.exe -c "from ppisp import PPISP, PPISPConfig; print('ppisp OK')"
 ```
 
 ## 6. 数据要求
