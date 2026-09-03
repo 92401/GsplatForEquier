@@ -119,6 +119,14 @@ def parse_args():
     # --- 增密 / 效率---
     p.add_argument("--absgrad", action="store_true",
                    help="AbsGS: absolute 2D gradients for densification (default strategy)")
+    p.add_argument("--max-gaussians", type=int, default=0,
+                   help="cap Gaussian count for mcmc strategy "
+                        "(maps to gsplat native cap_max; 0 = off, "
+                        "default 1e6). ignored by default strategy")
+    p.add_argument("--grow-grad2d", type=float, default=None,
+                   help="densify threshold on 2D gradient (default: "
+                        "0.0008 with --absgrad, else 0.0002); "
+                        "lower = densify earlier/more aggressively")
     p.add_argument("--packed", action="store_true",
                    help="packed rasterization (less memory, slightly slower)")
     p.add_argument("--sparse-grad", action="store_true",
@@ -284,17 +292,25 @@ def make_strategy(cfg, splats, optimizers, scene_scale):
         # AbsGS：用绝对 2D 梯度做增密，按 gsplat 文档 grow_grad2d 应提到 0.0008
         strategy = DefaultStrategy(
             absgrad=cfg.absgrad,
-            grow_grad2d=0.0008 if cfg.absgrad else 0.0002,
+            grow_grad2d=(cfg.grow_grad2d
+                         if cfg.grow_grad2d is not None
+                         else (0.0008 if cfg.absgrad else 0.0002)),
         )
         strategy.check_sanity(splats, optimizers)  #这个函数是干啥的
         state = strategy.initialize_state(scene_scale=scene_scale)
+        if cfg.max_gaussians > 0:
+            print("[cfg] warning: --max-gaussians applies to mcmc strategy "
+                  "(native cap_max); ignored with default strategy")
     else:
         if cfg.absgrad:
             print("[cfg] warning: --absgrad only applies to default strategy; "
                   "ignored with mcmc")
-        strategy = MCMCStrategy()
+        strategy = MCMCStrategy(cap_max=cfg.max_gaussians or 1_000_000)
         strategy.check_sanity(splats, optimizers)
         state = strategy.initialize_state()
+        if cfg.max_gaussians > 0:
+            print(f"[cfg] max_gaussians={cfg.max_gaussians} "
+                  f"(mcmc strategy -> cap_max)")
     return strategy, state
 
 
