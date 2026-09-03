@@ -31,6 +31,7 @@ import torch
 import torch.nn.functional as F
 
 from data import (
+    CACHE_VERSION,
     FACE_DIRS,
     EquirectCamera,
     build_face_c2w,
@@ -176,6 +177,10 @@ def parse_args():
                    help="random background color per step (discourage floaters)")
     p.add_argument("--face-cache", default="",
                    help="optional dir to cache warped faces (uint8 .pt per pano)")
+    p.add_argument("--face-cache-cpu", action="store_true",
+                   help="preload warped faces into CPU RAM once at startup "
+                        "(requires --face-cache); skips per-step disk "
+                        "load+pickle, trading ~1.6GB RAM for 354 panos at 512")
     p.add_argument("--save-every", type=int, default=0,
                    help="save ckpt+ply every N steps (0 = final only)")
     p.add_argument("--preview-every", type=int, default=0,
@@ -663,6 +668,42 @@ def main():
         print(f"[data] coarse-to-fine: {cfg.coarse_face_size} -> {S} "
               f"at step {cfg.coarse_steps}")
 
+    # ---- 2b. 启动期预计算（把训练循环里每步重复的固定操作挪到循环外）----
+    # GPU 常驻的位姿/内参：循环内不再 from_numpy + float + to(device)
+    c2w_t = torch.from_numpy(c2w).float().to(device)          # [N,4,4]
+    if is_pano:
+        face_c2w_t = torch.from_numpy(face_c2w).float().to(device)  # [N,6,4,4]
+    else:
+        face_c2w_t = c2w_t[:, None, :, :].contiguous()        # [N,1,4,4]
+    Ks = Ks.float().to(device) if is_pano else Ks             # [6,3,3] 预转 GPU
+    if Ks_coarse is not None:
+        Ks_coarse = Ks_coarse.to(device)
+
+    # CPU 常驻面缓存：启动时把所有全景的 warp 面一次性读进 RAM
+    # （uint8 原样保存，约 1.6GB/354 张@512），训练循环里只做内存索引，
+    # 跳过每步的磁盘 torch.load + pickle 反序列化。
+    faces_cpu = {}   # {face_size: list of [6,S,S,3] uint8 CPU tensors}
+    if cfg.face_cache and cfg.face_cache_cpu and is_pano:
+        sizes_to_preload = {S}
+        if cfg.coarse_face_size > 0:
+            sizes_to_preload.add(cfg.coarse_face_size)
+        for sz in sorted(sizes_to_preload):
+            arr = []
+            for pano_path in pano_paths:
+                cache_path = os.path.join(
+                    cfg.face_cache,
+                    f"{os.path.splitext(os.path.basename(pano_path))[0]}"
+                    f"_{sz}_v{CACHE_VERSION}.pt",
+                )
+                if not os.path.exists(cache_path):
+                    # 缺缓存：现切一张（GPU warp），顺带落盘
+                    get_faces(pano_path, equirect, sz, cfg.face_cache, device)
+                arr.append(torch.load(cache_path, map_location="cpu"))
+            faces_cpu[sz] = arr
+            print(f"[data] preloaded {len(arr)} panos @ face {sz} "
+                  f"into CPU RAM "
+                  f"({sum(t.numel() for t in arr) * 1 / 1024**3:.2f} GiB)")
+
     # ---- 3. splats + optimizer + strategy --------------------------------
     splats = make_splats(points_xyz, points_rgb, cfg, device)  # 点云注册为高斯椭球存到gpu
     optimizers = make_optimizers(splats, cfg, scene_scale)
@@ -676,12 +717,24 @@ def main():
     # ---- 4. training loop -------------------------------------------------
     B = cfg.batch_size  #每一步几张全景影像
     pbar_steps = cfg.steps
+    # per-epoch 确定性抽样：预生成打乱后的训练索引池，顺序消费；
+    # 池耗尽时重新打乱（每 epoch 每张全景恰好出现一次），
+    # 替代 random.choice 的放回抽样，避免同一张被重复监督的浪费。
+    epoch_pool = list(train_idx)
+    random.shuffle(epoch_pool)
+    pool_pos = 0
     tic = time.time()
     loss_log = []  #训练过程 loss 历史（step/loss/l1/ssim/depth_loss/gs/mem/time）
     for step in range(pbar_steps):
         depthloss = None  #预初始化：仅深度监督启用时才会被赋值，供 loss 日志读取
         n_used = 0
-        idxs = [random.choice(train_idx) for _ in range(B)]  #抽取B张训练影像 idx抽中的原始图像编号
+        idxs = []
+        for _ in range(B):
+            if pool_pos >= len(epoch_pool):
+                random.shuffle(epoch_pool)   #一个 epoch 结束，重新打乱
+                pool_pos = 0
+            idxs.append(epoch_pool[pool_pos])
+            pool_pos += 1
         # 粗到细：切换当前面的尺寸与内参
         if is_pano and Ks_coarse is not None and step < cfg.coarse_steps:  #粗阶段
             S_cur, Ks_cur = cfg.coarse_face_size, Ks_coarse
@@ -694,12 +747,16 @@ def main():
         Ks_list = []   #每个面的内参列表
         for idx in idxs:  #为每一张全幅影像分幅出6个面（或透视图直接用），一般idx==1，除非电脑性能较高
             if is_pano:
-                gts.append(get_faces(pano_paths[idx], equirect, S_cur,
-                                     cfg.face_cache, device))   #分幅出6个面的图像并存到gpu
+                if faces_cpu:  #CPU 常驻：只做内存索引 + 转 float 上 GPU
+                    faces_u8 = faces_cpu[S_cur][idx]
+                    gts.append((faces_u8.float().to(device) / 255.0))
+                else:  #原来的磁盘缓存路径
+                    gts.append(get_faces(pano_paths[idx], equirect, S_cur,
+                                         cfg.face_cache, device))   #分幅出6个面的图像并存到gpu
                 if pose_adjust is not None:
                     # rig 感知位姿优化：先修正全景位姿，再派生 6 个面
                     from pose import adjust_pano_pose
-                    pano_c2w_t = torch.from_numpy(c2w[idx]).float().to(device) #取当前全景的位姿
+                    pano_c2w_t = c2w_t[idx]  #取当前全景的位姿（已预转 GPU）
                     adj = adjust_pano_pose(pose_adjust, pano_c2w_t,
                                            grid_pos[idx])[0]  # [4,4]  #修正后的全景位姿
                     faces_t = []  #从修正后的位姿计算6个面的位姿
@@ -711,8 +768,8 @@ def main():
                         faces_t.append(out)
                     c2ws.append(torch.stack(faces_t))
                 else:
-                    c2ws.append(torch.from_numpy(face_c2w[idx]).float())
-                Ks_list.append(Ks_cur.to(device))  #每个面的内参
+                    c2ws.append(face_c2w_t[idx])
+                Ks_list.append(Ks_cur)  #每个面的内参（已预转 GPU）
                 H, W = S_cur, S_cur #照片尺寸
             else: #针孔相机
                 img = load_pano(pano_paths[idx]).to(device)     # [H, W, 3]
@@ -725,17 +782,16 @@ def main():
                 K0[1] *= sy
                 gts.append(img.unsqueeze(0))
                 if pose_adjust is not None:
-                    c2w_t = torch.from_numpy(c2w[idx]).float().to(device)
                     ids = torch.tensor([grid_pos[idx]], device=device)
-                    c2w_t = pose_adjust(c2w_t.unsqueeze(0), ids)[0]
-                    c2ws.append(c2w_t.unsqueeze(0))
+                    c2w_adj = pose_adjust(c2w_t[idx].unsqueeze(0), ids)[0]
+                    c2ws.append(c2w_adj.unsqueeze(0))
                 else:
-                    c2ws.append(torch.from_numpy(face_c2w[idx]).float())
+                    c2ws.append(face_c2w_t[idx])
                 Ks_list.append(K0.unsqueeze(0))
                 H, W = img.shape[0], img.shape[1]
-        gt = torch.cat(gts, dim=0).to(device)            # [B*faces, H, W, 3] 分幅出的真实图像
-        camtoworlds = torch.cat(c2ws, dim=0).to(device)  # [B*faces, 4, 4] 分幅后的相机位姿
-        Ks_b = torch.cat(Ks_list, dim=0).to(device)      # [B*faces, 3, 3] 分幅后的内参
+        gt = torch.cat(gts, dim=0)                       # [B*faces, H, W, 3] 分幅出的真实图像（已在 GPU）
+        camtoworlds = torch.cat(c2ws, dim=0)             # [B*faces, 4, 4] 分幅后的相机位姿
+        Ks_b = torch.cat(Ks_list, dim=0)                 # [B*faces, 3, 3] 分幅后的内参
         # bilagrid 网格索引：全景按面、透视按图（每个训练视角独立网格）
         if bil_grids is not None:
             grid_ids = []   #双边网格的编号
