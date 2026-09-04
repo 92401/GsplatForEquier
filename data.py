@@ -381,7 +381,8 @@ def get_faces(pano_path: str, equirect: EquirectCamera, face_size: int,
         )
         if os.path.exists(cache_path):
             faces_u8 = torch.load(cache_path, map_location="cpu")
-            return faces_u8.float().to(device) / 255.0
+            # uint8 直接传 GPU 再转 float：避免 CPU 展开成 4x float32 再 H2D
+            return faces_u8.to(device).float() / 255.0
     pano = load_pano(pano_path)   #加载全景影像
     faces = warp_pano_to_faces(pano, equirect, face_size, device=device)
     if cache_dir:

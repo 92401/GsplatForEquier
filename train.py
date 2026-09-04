@@ -128,6 +128,9 @@ def parse_args():
                    help="cap Gaussian count for mcmc strategy "
                         "(maps to gsplat native cap_max; 0 = off, "
                         "default 1e6). ignored by default strategy")
+    p.add_argument("--mcmc-refine-stop", type=int, default=0,
+                   help="stop MCMC refine (relocate/add) after this step; "
+                        "0 = gsplat default 25000. Spirula uses 5000.")
     p.add_argument("--grow-grad2d", type=float, default=None,
                    help="densify threshold on 2D gradient (default: "
                         "0.0008 with --absgrad, else 0.0002); "
@@ -314,7 +317,11 @@ def make_strategy(cfg, splats, optimizers, scene_scale):
         if cfg.absgrad:
             print("[cfg] warning: --absgrad only applies to default strategy; "
                   "ignored with mcmc")
-        strategy = MCMCStrategy(cap_max=cfg.max_gaussians or 1_000_000)
+        if cfg.mcmc_refine_stop > 0:
+            strategy = MCMCStrategy(cap_max=cfg.max_gaussians or 1_000_000,
+                                    refine_stop_iter=cfg.mcmc_refine_stop)
+        else:
+            strategy = MCMCStrategy(cap_max=cfg.max_gaussians or 1_000_000)
         strategy.check_sanity(splats, optimizers)
         state = strategy.initialize_state()
         if cfg.max_gaussians > 0:
@@ -786,7 +793,9 @@ def main():
             if is_pano:
                 if faces_cpu:  #CPU 常驻：只做内存索引 + 转 float 上 GPU
                     faces_u8 = faces_cpu[S_cur][idx]
-                    gts.append((faces_u8.float().to(device) / 255.0))
+                    # uint8 直接传 GPU（19MB@1024）再在 GPU 转 float，
+                    # 避免 CPU 上先展开成 75MB float32 再 H2D（4x 传输）
+                    gts.append(faces_u8.to(device, non_blocking=True).float() / 255.0)
                 else:  #原来的磁盘缓存路径
                     gts.append(get_faces(pano_paths[idx], equirect, S_cur,
                                          cfg.face_cache, device))   #分幅出6个面的图像并存到gpu
