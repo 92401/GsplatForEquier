@@ -160,19 +160,21 @@ def read_points3d_bin(path: str):
 # Equirectangular camera math (COLMAP model 17 / Spirula sfm convention)
 # ---------------------------------------------------------------------------
 
-class EquirectCamera:
+class EquirectCamera:  #全景相机类
     """Spherical (equirectangular) camera: the image IS the calibration."""
 
     def __init__(self, width: int, height: int):
         self.width = width  #分幅的透视投影像素
         self.height = height
-        self.fx = width / (2.0 * math.pi)
+        self.fx = width / (2.0 * math.pi)  #根据用户定义的分幅影像素，计算内参
         self.fy = height / math.pi
         self.cx = width / 2.0
         self.cy = height / 2.0
 
     def project(self, xyz_cam: torch.Tensor) -> torch.Tensor:
         """Camera-frame unit direction (..., 3) -> pixel coords (..., 2)."""
+        #把 3D 空间方向（射线）映射到全景图像的 2D 像素坐标
+        #把相机系下的 3D 向量 (x, y, z) 通过两个角度（θ 经度、φ 纬度）映射到全景图的像素 (u, v)。
         theta = torch.atan2(xyz_cam[..., 0], xyz_cam[..., 2])
         phi = torch.atan2(-xyz_cam[..., 1],
                           torch.hypot(xyz_cam[..., 0], xyz_cam[..., 2]))
@@ -198,7 +200,7 @@ FACE_DIRS = {
 
 def _normalize(v: np.ndarray) -> np.ndarray:
     n = np.linalg.norm(v)
-    return v / n if n > 1e-12 else np.array([0.0, 0.0, 1.0])
+    return v / n if n > 1e-12 else np.array([0.0, 0.0, 1.0])   #把向量归一化，避免除0错误
 
 
 def face_rotation(direction) -> np.ndarray:
@@ -208,13 +210,14 @@ def face_rotation(direction) -> np.ndarray:
     its up as close to the pano camera's up (+Y) as possible.  R_face is
     orthonormal, so d_face = R_face @ d_pano and the inverse is R_face^T.
     """
+    #给定一个面相机的视向方向 direction， R_face这个变量用来把全景相机坐标系的坐标变换到面相机坐标系
     d = _normalize(np.asarray(direction, dtype=np.float64))
     up = np.array([0.0, 1.0, 0.0])
     if abs(np.dot(d, up)) > 0.9:
         up = np.array([0.0, 0.0, -1.0])
     x = _normalize(np.cross(up, d))
     y = np.cross(d, x)
-    return np.stack([x, y, d], axis=0)
+    return np.stack([x, y, d], axis=0)  
 
 
 def build_face_c2w(c2w_pano: np.ndarray, R_face: np.ndarray) -> np.ndarray:
@@ -224,7 +227,7 @@ def build_face_c2w(c2w_pano: np.ndarray, R_face: np.ndarray) -> np.ndarray:
     out = np.eye(4, dtype=np.float64)
     out[:3, :3] = R @ R_face.T  # face w2c rotation = R_face @ R_w2c; invert
     out[:3, 3] = C              # same camera center
-    return out
+    return out  #把全幅的c2w变为面的c2w
 
 
 def pinhole_intrinsics(face_size: int) -> np.ndarray:
@@ -238,7 +241,7 @@ def face_pixel_grid(face_size: int, device="cpu") -> torch.Tensor:
     u = torch.arange(face_size, dtype=torch.float32, device=device) + 0.5
     v = torch.arange(face_size, dtype=torch.float32, device=device) + 0.5
     grid_u, grid_v = torch.meshgrid(u, v, indexing="xy")
-    return torch.stack([grid_u, grid_v], dim=-1)  # [S, S, 2]
+    return torch.stack([grid_u, grid_v], dim=-1)  # [S, S, 2]  #算出每个面的中心坐标
 
 
 def face_ray_directions(face_size: int, device="cpu") -> torch.Tensor:
@@ -248,7 +251,7 @@ def face_ray_directions(face_size: int, device="cpu") -> torch.Tensor:
     x = (px[..., 0] - f) / f
     y = (px[..., 1] - f) / f   #算出像素相对于面中心的偏移坐标
     d = torch.stack([x, y, torch.ones_like(x)], dim=-1)
-    return F.normalize(d, dim=-1)
+    return F.normalize(d, dim=-1)  #把面像素转换为面系的射线方向向量
 
 
 def warp_pano_to_faces(
@@ -389,7 +392,6 @@ def get_faces(pano_path: str, equirect: EquirectCamera, face_size: int,
 def build_sparse_depths(sparse: dict, images: list, face_rots=None,
                         S: int = 0, is_pano: bool = True,
                         c2w=None, pts=None) -> list:
-      #函数可能存在的问题
       #1,||Xc|| vs Xc[2]必须与gsplat 渲染端深度输出方式一致。如果渲染输出的是 Z 深度，这里要改成 Xc[2]
      #2像素中心约定：+f（不是 +f-0.5 或 +f+0.5），和 face_pixel_grid 的 arange + 0.5 配套
      #位姿来源分支：c2w is not None 时用的是归一化场景下的位姿，对应归一化后的 points_xyz

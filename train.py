@@ -94,7 +94,7 @@ def parse_args():
     p.add_argument("--out-dir", default=r"D:\gaussian_splatting\pano_gsplat\outputs\run")
     p.add_argument("--max-images", type=int, default=0,
                    help="limit to the first N panoramas (0 = all)")
-    p.add_argument("--face-size", type=int, default=512,
+    p.add_argument("--face-size", type=int, default=512,   #测试的时候512，训练的时候1024
                    help="edge length of each of the 6 pinhole faces")
     p.add_argument("--batch-size", type=int, default=1,
                    help="panoramas per training step (6 faces each)")
@@ -124,7 +124,7 @@ def parse_args():
     # --- 增密 / 效率---
     p.add_argument("--absgrad", action="store_true",
                    help="AbsGS: absolute 2D gradients for densification (default strategy)")
-    p.add_argument("--max-gaussians", type=int, default=0,
+    p.add_argument("--max-gaussians", type=int, default=0,   #只有mcmc的时候需要开
                    help="cap Gaussian count for mcmc strategy "
                         "(maps to gsplat native cap_max; 0 = off, "
                         "default 1e6). ignored by default strategy")
@@ -132,9 +132,9 @@ def parse_args():
                    help="densify threshold on 2D gradient (default: "
                         "0.0008 with --absgrad, else 0.0002); "
                         "lower = densify earlier/more aggressively")
-    p.add_argument("--packed", action="store_true",
+    p.add_argument("--packed", action="store_true",   #是否使用稀疏梯度
                    help="packed rasterization (less memory, slightly slower)")
-    p.add_argument("--sparse-grad", action="store_true",
+    p.add_argument("--sparse-grad", action="store_true", #稀疏优化器和稀疏梯度配合只更新有梯度的高斯，更省显存也更慢
                    help="sparse gradients (requires --packed)")
     # --- 评测---
     p.add_argument("--test-every", type=int, default=0,
@@ -181,7 +181,7 @@ def parse_args():
                    help="random background color per step (discourage floaters)")
     p.add_argument("--face-cache", default="",
                    help="optional dir to cache warped faces (uint8 .pt per pano)")
-    p.add_argument("--face-cache-cpu", action="store_true",
+    p.add_argument("--face-cache-cpu", action="store_true",   #是否使用CPU缓存分幅的数据，缩短训练时间占内存
                    help="preload warped faces into CPU RAM once at startup "
                         "(requires --face-cache); skips per-step disk "
                         "load+pickle, trading ~1.6GB RAM for 354 panos at 512")
@@ -191,8 +191,8 @@ def parse_args():
                    help="save GT|render montage every N steps")
     p.add_argument("--loss-log-every", type=int, default=1,
                    help="record loss history every N steps "
-                        "(saved to loss_history.csv/json at end)")
-    p.add_argument("--export-absolute", action="store_true",
+                        "(saved to loss_history.csv/json at end)")  #记录损失历史
+    p.add_argument("--export-absolute", action="store_true",  #输出地理坐标的高斯模型
                    help="训练结束额外输出还原到输入坐标系的 splat_absolute.ply"
                         "（若 sparse 为 ENU/UTM 等绝对坐标，即地理坐标模型）"
                         " + norm.json（归一化 center/scale）")
@@ -336,7 +336,7 @@ def save_ply(splats, path):
     )
 
 
-def save_preview(gt, render, path, device):
+def save_preview(gt, render, path, device):  #保存渲染结果
     """Save a GT|render montage of the batch (faces or images) as one PNG."""
     canvas = torch.cat([gt, render], dim=2)  # [C, S, 2S, 3]
     canvas = canvas.reshape(-1, canvas.shape[2], 3).clamp(0, 1)
@@ -463,7 +463,7 @@ def main():
     print(f"[cfg] strategy={cfg.strategy} init_scale={cfg.init_scale} "
           f"init_opacity={cfg.init_opacity} scale_reg={cfg.scale_reg} "
           f"opacity_reg={cfg.opacity_reg}")
-    if cfg.sparse_grad and not cfg.packed:
+    if cfg.sparse_grad and not cfg.packed:   #稀疏梯度和稀疏优化器配合使用
         print("[cfg] --sparse-grad requires --packed; enabling packed mode")
         cfg.packed = True
     if cfg.depth_dir and cfg.depth_supervision_weight <= 0.0:
@@ -507,7 +507,7 @@ def main():
             raise FileNotFoundError(path)
         pano_paths.append(path) #存储每个全景照片的路径
 
-    # 训练/验证拆分（--test-every 每 N 张留 1 张做验证）  用全幅做验证还是用分出来的单张做验证更合理？
+    # 训练/验证拆分（--test-every 每 N 张留 1 张做验证）  用全幅做验证还是用分出来的单张做验证更合理
     if cfg.test_every > 0:
         val_idx = list(range(cfg.test_every - 1, len(images), cfg.test_every))  #按照全景图像做验证
         train_idx = [i for i in range(len(images)) if i not in set(val_idx)]
@@ -532,7 +532,7 @@ def main():
     S = cfg.face_size  #设置分幅照片的尺寸
     cam_by_id = {c["id"]: c for c in cameras}   #根据相机id查找相机参数
     if is_pano:
-        K = pinhole_intrinsics(S)  #设置虚拟针孔相机的内参
+        K = pinhole_intrinsics(S)  #设置虚拟针孔相机的内参，用分幅像素算的
         # 6 个面共享同一套内参，复制 6 份，复制6份所以命名为Ks
         Ks = torch.from_numpy(np.repeat(K[None], len(FACE_DIRS), axis=0)).float()
         # [n_pano, 6, 4, 4]：为每一张全幅的相机构建 6 个面的相机转世界矩阵
@@ -578,10 +578,10 @@ def main():
             print(f"[data] loading dense-depth cache: {cache_dir}")
             for cp in cache_files:
                 obj = torch.load(cp, map_location="cpu")
-                dense_aligned.append(obj["disp"])
-                dense_counts.append(obj["count"])
-        else:
-            print(f"[data] building dense-depth cache -> {cache_dir}")
+                dense_aligned.append(obj["disp"])  #disp是6个面的稠密深度图，
+                dense_counts.append(obj["count"]) #count是6个面的有效像素数，用于归一化场景尺度
+        else:  #下面是计算稠密深度的核心代码
+            print(f"[data] building dense-depth cache -> {cache_dir}") #没预先计算，需要计算稠密深度
             os.makedirs(cache_dir, exist_ok=True)
             dense_raw = []    #原始稠密深度图
             for im in images_train:
@@ -591,14 +591,14 @@ def main():
                 if not os.path.exists(dp):
                     raise FileNotFoundError(dp)
                 dense_raw.append(torch.load(dp, map_location="cpu").float())  # [6,S,S]
-            dense_aligned_f32 = []  #对齐后的稠密深度图（fp32，构建缓存时临时持有）
+            dense_aligned_f32 = []  #对齐后的稠密深度图（fp32，构建缓存时临时持有）  f32 是 float32 的缩写
             all_ratios = []
             for pos in range(len(images_train)):
                 aligned = dense_raw[pos].clone()  #克隆一份深度图，为什么评价不加深度图?
                 dense_raw[pos] = None  #逐张释放原始深度，降低构建缓存时的 CPU 峰值
                 ratios = []
                 for f in range(6):
-                    px_f, d_f = depth_train[pos][f]  ## 该面的稀疏监督深度图 (px[M,2], d[M])
+                    px_f, d_f = depth_train[pos][f]  ## 该切面的稀疏监督深度图 (px[M,2], d[M])
                     if len(px_f) < 5:
                         continue
                     grid = torch.from_numpy(np.stack(
@@ -608,7 +608,7 @@ def main():
                     samp = F.grid_sample(
                         aligned[f][None, None], grid, align_corners=True
                     )[0, 0, 0, :]  # 用稀疏点像素位置去稠密深度图上采样
-                    d_gt_t = torch.from_numpy(d_f).float()
+                    d_gt_t = torch.from_numpy(d_f).float()  #稀疏深度监督，转换为fp32
                     m = (samp > 0) & (d_gt_t > 0)  #统计有效样本数量
                     if m.sum() >= 5:  #有效样本大于5才使用中位数计算
                         r = d_gt_t[m].median() / samp[m].median()
@@ -657,7 +657,7 @@ def main():
         )
     
 
-    # bilagrid 曝光/白平衡校正（全景按面、透视按图，每个训练视角一个网格）  全幅用得上这个吗？
+    # bilagrid 曝光/白平衡校正（全景按面、透视按图，每个训练视角一个网格）  
     bil_grids = None  #每个全幅影像的双边网格，用于曝光/白平衡校正
     bil_optimizer = None  #曝光/白平衡校正优化器，用于训练时更新曝光/白平衡参数
     if cfg.bilagrid:
@@ -689,7 +689,7 @@ def main():
             n_frames = n_cameras = len(train_idx) * faces_per_image  #另一种模式每个训练视角一个网格
             print(f"[ppisp] {n_frames} per-view slots "
                   f"(Spirula style, controller disabled)")
-        ppisp_cfg = PPISPConfig(use_controller=False)  #不使用控制器，也就是在训练器光度矫正，并未使用新视角自动曝光能力，这样对吗？
+        ppisp_cfg = PPISPConfig(use_controller=False)  #不使用控制器，也就是在训练器光度矫正，未使用新视角自动曝光能力
         ppisp = PPISP(num_cameras=n_cameras, num_frames=n_frames,
                       config=ppisp_cfg).to(device)
         ppisp_optimizers = ppisp.create_optimizers()
@@ -706,7 +706,7 @@ def main():
               f"at step {cfg.coarse_steps}")
 
     # ---- 2b. 启动期预计算（把训练循环里每步重复的固定操作挪到循环外）----
-    # GPU 常驻的位姿/内参：循环内不再 from_numpy + float + to(device)
+    # GPU 常驻的位姿/内参：循环内不再 from_numpy + float + to(device)  加速训练增加一点显存占用
     c2w_t = torch.from_numpy(c2w).float().to(device)          # [N,4,4]
     if is_pano:
         face_c2w_t = torch.from_numpy(face_c2w).float().to(device)  # [N,6,4,4]
@@ -768,7 +768,7 @@ def main():
         idxs = []
         for _ in range(B):
             if pool_pos >= len(epoch_pool):
-                random.shuffle(epoch_pool)   #一个 epoch 结束，重新打乱
+                random.shuffle(epoch_pool)   #一个 epoch 结束，重新打乱 防止传统choice的放回抽样
                 pool_pos = 0
             idxs.append(epoch_pool[pool_pos])
             pool_pos += 1
@@ -934,7 +934,8 @@ def main():
                             )[0, 0]  #双线性插值获取稠密视差
                         if int(dense_counts[pos][f]) < 100:  #有效像素不足100个，跳过（计数已在缓存预计算）
                             continue
-                        valid = disp_map > 0  #有效像素（视差>0，无效像素缓存里存的是 0）
+                        # 有效像素 = GT 有效(视差>0) 且渲染有深度(>0)，排除未覆盖像素避免 1/0=inf
+                        valid = (disp_map > 0) & (depths_ed[ci, ..., 0] > 0)
                         disp_gt = disp_map[valid].float()  #GT 视差（缓存已做过 1/深度）
                         disp_rend = 1.0 / depths_ed[ci, ..., 0][valid]  #渲染视差 = 1/深度
                         depthloss = depthloss + F.l1_loss(disp_rend, disp_gt) * scene_scale
