@@ -61,6 +61,10 @@ try:
 except Exception:
     HAVE_TORCHMETRICS = False
 
+# 稠密深度预处理缓存版本：缓存为“对齐后的 fp16 视差 + 每面有效像素计数”。
+# 改了对齐逻辑或换了 MoGe 输出（分辨率/尺度）时把这个版本号 +1 即可强制重建。
+DENSE_CACHE_VERSION = 1
+
 
 def load_config_file(path: str) -> dict:
     """加载 JSON/YAML 配置文件（键 = 参数名，连字符键会被归一化为下划线）。"""
@@ -560,50 +564,83 @@ def main():
     #MoGe（单目深度估计网络）输出的稠密深度图是无尺度的相对深度——需要归一化场景尺度，
     # 用colmap的系数点当作锚点，给稠密深度乘比例系数让两者在重合像素上对齐
     if cfg.depth_dir and is_pano:
-        dense_raw = []    #原始稠密深度图
-        for im in images_train:
-            dp = os.path.join(cfg.depth_dir,
-                              os.path.splitext(im["name"])[0] + ".pt")  #每张全景一个pt文件
-                                #里面是wrap的6个面的稠密深度图
-            if not os.path.exists(dp):
-                raise FileNotFoundError(dp)
-            dense_raw.append(torch.load(dp, map_location="cpu").float())  # [6,S,S]
-        dense_aligned = []  #对齐后的稠密深度图
-        all_ratios = []
-        for pos in range(len(images_train)):
-            aligned = dense_raw[pos].clone()  #克隆一份深度图，为什么评价不加深度图?
-            ratios = []
-            for f in range(6):
-                px_f, d_f = depth_train[pos][f]  ## 该面的稀疏监督深度图 (px[M,2], d[M])
-                if len(px_f) < 5:
-                    continue
-                grid = torch.from_numpy(np.stack(
-                    [px_f[:, 0] / (S - 1) * 2 - 1,
-                     px_f[:, 1] / (S - 1) * 2 - 1], -1)
-                ).float().unsqueeze(0).unsqueeze(0)  #稀疏点像素坐标归一化到[-1,1]
-                samp = F.grid_sample(
-                    aligned[f][None, None], grid, align_corners=True
-                )[0, 0, 0, :]  # 用稀疏点像素位置去稠密深度图上采样
-                d_gt_t = torch.from_numpy(d_f).float()
-                m = (samp > 0) & (d_gt_t > 0)  #统计有效样本数量
-                if m.sum() >= 5:  #有效样本大于5才使用中位数计算
-                    r = d_gt_t[m].median() / samp[m].median()
-                    ratios.append(float(r))
-                    aligned[f] = aligned[f] * r
-            for f in range(6):
-                if len(depth_train[pos][f][0]) < 5:
-                    ratios.append(float("nan"))   #小于5的先设置为nan
-            all_ratios.extend(ratios)
-            dense_aligned.append(aligned)
-        ratios = torch.tensor([r for r in all_ratios if np.isfinite(r)])
-        if len(ratios) == 0:
-            raise RuntimeError("no sparse depth overlap for dense alignment")
-        global_r = float(ratios.median())  #都做完之后统计全局比例，为之前nan的设置全局比例
-        for pos in range(len(dense_aligned)):  #对于那些没有有效样本的面，用全局比例对齐
-            for f in range(6):
-                if len(depth_train[pos][f][0]) < 5:
-                    dense_aligned[pos][f] = dense_aligned[pos][f] * global_r
-        print(f"[data] dense depth aligned (global scale {global_r:.4f})")
+        # 稠密深度预处理缓存：首次构建时把原始 MoGe 深度与 COLMAP 稀疏深度
+        # 对齐（中位比例），转成 fp16 视差（0=无效）并记录每面有效像素数，
+        # 之后启动直接读缓存，免去重复加载 + CPU grid_sample 对齐 + 每步换算。
+        cache_dir = os.path.join(cfg.depth_dir, f"aligned_v{DENSE_CACHE_VERSION}")
+        cache_files = [
+            os.path.join(cache_dir, os.path.splitext(im["name"])[0] + ".pt")
+            for im in images_train
+        ]
+        dense_aligned = []  #每张全景 [6,S,S] fp16 视差（0=无效，已对齐场景尺度）
+        dense_counts = []   #每张 [6] int32：各面有效像素数（原始 S 分辨率）
+        if all(os.path.exists(cp) for cp in cache_files):
+            print(f"[data] loading dense-depth cache: {cache_dir}")
+            for cp in cache_files:
+                obj = torch.load(cp, map_location="cpu")
+                dense_aligned.append(obj["disp"])
+                dense_counts.append(obj["count"])
+        else:
+            print(f"[data] building dense-depth cache -> {cache_dir}")
+            os.makedirs(cache_dir, exist_ok=True)
+            dense_raw = []    #原始稠密深度图
+            for im in images_train:
+                dp = os.path.join(cfg.depth_dir,
+                                  os.path.splitext(im["name"])[0] + ".pt")  #每张全景一个pt文件
+                                    #里面是wrap的6个面的稠密深度图
+                if not os.path.exists(dp):
+                    raise FileNotFoundError(dp)
+                dense_raw.append(torch.load(dp, map_location="cpu").float())  # [6,S,S]
+            dense_aligned_f32 = []  #对齐后的稠密深度图（fp32，构建缓存时临时持有）
+            all_ratios = []
+            for pos in range(len(images_train)):
+                aligned = dense_raw[pos].clone()  #克隆一份深度图，为什么评价不加深度图?
+                dense_raw[pos] = None  #逐张释放原始深度，降低构建缓存时的 CPU 峰值
+                ratios = []
+                for f in range(6):
+                    px_f, d_f = depth_train[pos][f]  ## 该面的稀疏监督深度图 (px[M,2], d[M])
+                    if len(px_f) < 5:
+                        continue
+                    grid = torch.from_numpy(np.stack(
+                        [px_f[:, 0] / (S - 1) * 2 - 1,
+                         px_f[:, 1] / (S - 1) * 2 - 1], -1)
+                    ).float().unsqueeze(0).unsqueeze(0)  #稀疏点像素坐标归一化到[-1,1]
+                    samp = F.grid_sample(
+                        aligned[f][None, None], grid, align_corners=True
+                    )[0, 0, 0, :]  # 用稀疏点像素位置去稠密深度图上采样
+                    d_gt_t = torch.from_numpy(d_f).float()
+                    m = (samp > 0) & (d_gt_t > 0)  #统计有效样本数量
+                    if m.sum() >= 5:  #有效样本大于5才使用中位数计算
+                        r = d_gt_t[m].median() / samp[m].median()
+                        ratios.append(float(r))
+                        aligned[f] = aligned[f] * r
+                for f in range(6):
+                    if len(depth_train[pos][f][0]) < 5:
+                        ratios.append(float("nan"))   #小于5的先设置为nan
+                all_ratios.extend(ratios)
+                dense_aligned_f32.append(aligned)
+            del dense_raw
+            ratios = torch.tensor([r for r in all_ratios if np.isfinite(r)])
+            if len(ratios) == 0:
+                raise RuntimeError("no sparse depth overlap for dense alignment")
+            global_r = float(ratios.median())  #都做完之后统计全局比例，为之前nan的设置全局比例
+            for pos in range(len(dense_aligned_f32)):  #对于那些没有有效样本的面，用全局比例对齐
+                for f in range(6):
+                    if len(depth_train[pos][f][0]) < 5:
+                        dense_aligned_f32[pos][f] = dense_aligned_f32[pos][f] * global_r
+            print(f"[data] dense depth aligned (global scale {global_r:.4f})")
+            # 对齐后的深度转 fp16 视差写缓存：深度>0 且有限 -> 1/d，否则 0
+            for pos, aligned in enumerate(dense_aligned_f32):
+                valid = (aligned > 0) & torch.isfinite(aligned)
+                count = valid.float().sum(dim=(1, 2)).to(torch.int32)
+                disp = torch.where(
+                    valid, 1.0 / aligned, torch.zeros_like(aligned)
+                ).half()
+                torch.save({"disp": disp, "count": count}, cache_files[pos])
+                dense_aligned_f32[pos] = None
+                dense_aligned.append(disp)
+                dense_counts.append(count)
+            del dense_aligned_f32
 
     # 位姿优化：全景按张（6 面共享）、透视按图；默认零初始化，靠训练学小修正
     pose_adjust = None  #位姿修正，每张全景9个参数6个旋转3个平移
@@ -888,17 +925,17 @@ def main():
                 for f in range(faces_per_image):
                     ci = j * faces_per_image + f   #当前渲染面的编号
                     # 稠密深度路径（MoGe）：逐像素视差 L1，深度>0 视为有效
-                    if dense_aligned is not None:  #有稠密深度 走稠密路径 优先走这个路径
-                        d_map = dense_aligned[pos][f].to(device)  # 第 pos 张全景第 f 个面的对齐 MoGe 深度（在原始全分辨率 S 上）
-                        if S_cur != S:  #粗分辨率阶段走这里
-                            d_map = F.interpolate(
-                                d_map[None, None], size=(S_cur, S_cur),
+                    if dense_aligned is not None:  #稠密路径：缓存已是 fp16 视差（0=无效）
+                        disp_map = dense_aligned[pos][f].to(device)  #第 pos 张全景第 f 个面的对齐视差（S×S，fp16）
+                        if disp_map.shape[0] != S_cur:  #缓存分辨率与当前训练分辨率不一致（含粗阶段）时缩放
+                            disp_map = F.interpolate(
+                                disp_map[None, None], size=(S_cur, S_cur),
                                 mode="bilinear", align_corners=False,
-                            )[0, 0]  #双线性插值获取稠密深度
-                        valid = (d_map > 0) & torch.isfinite(d_map)  #有效像素
-                        if valid.sum() < 100:  #有效像素不足100个，跳过
+                            )[0, 0]  #双线性插值获取稠密视差
+                        if int(dense_counts[pos][f]) < 100:  #有效像素不足100个，跳过（计数已在缓存预计算）
                             continue
-                        disp_gt = 1.0 / d_map[valid]  #GT 视差 = 1/深度
+                        valid = disp_map > 0  #有效像素（视差>0，无效像素缓存里存的是 0）
+                        disp_gt = disp_map[valid].float()  #GT 视差（缓存已做过 1/深度）
                         disp_rend = 1.0 / depths_ed[ci, ..., 0][valid]  #渲染视差 = 1/深度
                         depthloss = depthloss + F.l1_loss(disp_rend, disp_gt) * scene_scale
                         #使用视差的原因是更符合感知和 SfM 误差模型，防止远处损失被稀释近处被夸大
